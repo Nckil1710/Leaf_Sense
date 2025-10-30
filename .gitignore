@@ -1,0 +1,12 @@
+# Virtual Environment
+venv/
+ENV/
+env/
+
+# Streamlit Secrets
+.streamlit/
+
+# Test Files
+a.py
+b.py
+

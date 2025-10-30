@@ -1,0 +1,72 @@
+{
+    "report_info": {
+        "title": "Integrated Plant Disease Detection & Expert System Report",
+        "timestamp": "2025-10-30 08:58:21",
+        "phases": 4
+    },
+    "input_data": {
+        "image_path": "/kaggle/input/plant-village/Data for Identification of Plant Leaf Diseases Using a 9-layer Deep Convolutional Neural Network/Plant_leaf_diseases_dataset_with_augmentation/Plant_leave_diseases_dataset_with_augmentation/Potato___Late_blight/image (100).JPG",
+        "image_filename": "image (100).JPG"
+    },
+    "phase_1_3_deep_learning": {
+        "phase_1_leaf_segmentation": {
+            "model": "YOLO",
+            "leaf_mask_shape": [
+                256,
+                320
+            ],
+            "total_leaf_pixels": 37774,
+            "status": "\u2705 Complete"
+        },
+        "phase_2_disease_segmentation": {
+            "model": "UNet (Segmentation Models PyTorch)",
+            "disease_mask_shape": [
+                256,
+                320
+            ],
+            "diseased_pixels": 6746,
+            "healthy_pixels": 31028,
+            "status": "\u2705 Complete"
+        },
+        "phase_3_disease_classification": {
+            "model": "DenseNet121 (Fallback: Folder Path)",
+            "predicted_disease": "Potato___Late_blight",
+            "predicted_disease_readable": "Potato - Late blight",
+            "class_index": 21,
+            "model_confidence": 0.9998694658279419,
+            "status": "\u2705 Complete"
+        }
+    },
+    "severity_quantification": {
+        "diseased_pixels": 6746,
+        "healthy_pixels": 31028,
+        "total_leaf_pixels": 37774,
+        "severity_percentage": 17.858844708000213,
+        "severity_label": "Moderate",
+        "severity_classification": {
+            "mild": "0-10%",
+            "moderate": "10-30%",
+            "severe": ">30%"
+        }
+    },
+    "phase_4_expert_system": {
+        "query_params": {
+            "disease_class": "Potato___Late_blight",
+            "severity_input": "MODERATE"
+        },
+        "disease_name": "Potato - Late blight",
+        "severity_level": "MODERATE",
+        "symptoms": "Water-soaked lesions on leaves with white mold on underside in moist conditions. Rapid leaf and stem blackening. Brown lesions on tubers. Foul odor in severe infections.",
+        "severity_description": "Multiple leaves show lesions with white growth",
+        "pesticides": "Mancozeb, Copper-based fungicides, Metalaxyl-m, Cymoxanil, Fluazinam",
+        "treatment": "Spray mancozeb (2.5g/L every 7 days). Remove infected foliage.",
+        "prevention": "Use certified disease-free seed. Plant resistant varieties. Apply protectant fungicides preventatively during wet weather. Destroy volunteer potatoes and cull piles. Improve air circulation. Avoid wet evening irrigation."
+    },
+    "actionable_recommendations": {
+        "immediate_action": "Spray mancozeb (2.5g/L every 7 days). Remove infected foliage.",
+        "pesticides_to_use": "Mancozeb, Copper-based fungicides, Metalaxyl-m, Cymoxanil, Fluazinam",
+        "prevention_strategy": "Use certified disease-free seed. Plant resistant varieties. Apply protectant fungicides preventatively during wet weather. Destroy volunteer potatoes and cull piles. Improve air circulation. Avoid wet evening irrigation.",
+        "severity_level": "Moderate",
+        "severity_percentage": 17.858844708000213
+    }
+}
