@@ -301,17 +301,12 @@ def main():
                 if img is not None:
                     source_type = "Uploaded file"
         elif input_mode == "Camera":
-            st.markdown("### 📸 Camera Input")
-            st.info("📱 On mobile: Tap the camera icon in the top-right corner of the preview to switch between front/back cameras")
-            
-            camera_image = st.camera_input("Take Photo with your camera")
-            
+            st.info("📱 On mobile: Tap the camera/rotate icon in the top or bottom of the preview to switch between front/back cameras. Availability depends on your mobile and browser.")
+            camera_image = st.camera_input("Take Photo (mobile/webcam)")
             if camera_image:
-                # Compress camera image
-                img_bytes = camera_image.getvalue()
-                img = compress_image(img_bytes)
-                if img is not None:
-                    source_type = "Captured photo"
+                img = cv2.imdecode(np.frombuffer(camera_image.getvalue(), np.uint8), cv2.IMREAD_COLOR)
+                source_type = "Captured photo"
+
 
         if img is not None:
             with st.container():
