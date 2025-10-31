@@ -18,6 +18,8 @@ import faiss
 import google.generativeai as genai
 from sentence_transformers import SentenceTransformer
 import warnings
+from PIL import Image
+import io
 warnings.filterwarnings('ignore')
 from datetime import datetime
 
@@ -82,6 +84,37 @@ def load_encoder(): return SentenceTransformer('all-MiniLM-L6-v2')
 def normalize_class_name(name):
     return (name.replace(" ", "_").replace("-", "_").replace("__", "___").strip().lower())
 
+# ===== FIX: Compress and validate image =====
+def compress_image(uploaded_file, max_size_mb=3):
+    """Compress image to prevent Streamlit Cloud 400 errors"""
+    try:
+        # Check file size
+        if uploaded_file.size > max_size_mb * 1024 * 1024:
+            st.error(f"❌ Image too large ({uploaded_file.size / (1024*1024):.1f}MB). Max {max_size_mb}MB allowed.")
+            return None
+        
+        # Open and compress
+        img = Image.open(uploaded_file)
+        
+        # Resize if too large
+        max_dim = 1280
+        if max(img.size) > max_dim:
+            img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+        
+        # Compress to JPEG
+        img_bytes = io.BytesIO()
+        img.save(img_bytes, format="JPEG", quality=80, optimize=True)
+        img_bytes.seek(0)
+        
+        # Convert to cv2 format
+        img_array = np.asarray(bytearray(img_bytes.read()), dtype=np.uint8)
+        cv2_img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        
+        return cv2_img
+    except Exception as e:
+        st.error(f"Image processing error: {e}")
+        return None
+
 def phase4_expert_system_inference(disease_class, severity_label, knowledge_base):
     normalized_kb = {normalize_class_name(k): k for k in knowledge_base}
     lookup_key = normalize_class_name(disease_class)
@@ -132,7 +165,6 @@ def disease_expert_advisor(disease_query, faiss_index, faiss_metadata, encoder, 
             "prevention": metadata['prevention'],
             "severity_levels": metadata['severity_levels']
         })
-    # Generate concise Gemini advice
     prompt = (
         f"A farmer asked: \"{disease_query}\"\n"
         "Give only actionable info: Disease, Severity (if possible), Immediate action, Recommended pesticides, Prevention tips, When to act/treat, nothing more.\n"
@@ -157,7 +189,6 @@ def disease_expert_advisor(disease_query, faiss_index, faiss_metadata, encoder, 
     return short_advice, results
 
 def generate_gemini_recommendation_phase5(expert_advice, rag_context, lang="English"):
-    # Short actionable summary prompt
     prompt = (
         f"ONLY use the expert-verified info below. Be extremely practical, keep it bullet style, show only: Disease, Severity, Immediate action, Recommended pesticides, Prevention tips, When to act/treat. Nothing else.\n"
         f"Disease: {expert_advice['disease_name']}\n"
@@ -213,10 +244,10 @@ def main():
         if mode == "Image Detection":
             st.markdown("#### 📸 Image Detection Mode")
             st.write(
-                "- Upload a **clear, full photo** of a single leaf on a plain background.\n"
-                "- Leaf should be visible edge-to-edge, with minimal shadow or overlap.\n"
-                "- Crop/zoom so the leaf fills most of the frame for best results.\n"
-                "- Upload a file for desktop, or 'Capture' on mobile/laptop with a webcam."
+                "- Upload a **clear, full photo** of a single leaf.\n"
+                "- Max 3MB recommended for smooth upload.\n"
+                "- Leaf should be visible, well-lit, no shadows.\n"
+                "- Desktop: upload file. Mobile: select from gallery."
             )
         else:
             st.markdown("#### 💭 Disease Expert Mode")
@@ -236,28 +267,27 @@ def main():
         faiss_index = load_faiss_index("faiss_index.bin")
         faiss_metadata = load_faiss_metadata("faiss_metadata.pkl")
         encoder = load_encoder()
+    
     if mode == "Image Detection":
-        input_mode = st.radio("How would you like to add your leaf photo?", ["Upload", "Camera"])
+        # ===== UPLOAD ONLY (no camera to avoid 400 error) =====
+        st.markdown("### Upload Your Leaf Image")
+        uploaded_file = st.file_uploader("Select leaf image from gallery", type=['jpg', 'jpeg', 'png'])
+        
         img, source_type = None, None
-        if input_mode == "Upload":
-            uploaded_file = st.file_uploader("Upload Leaf Image", type=['jpg', 'jpeg', 'png'])
-            if uploaded_file:
-                input_image_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-                img = cv2.imdecode(input_image_bytes, cv2.IMREAD_COLOR)
+        if uploaded_file:
+            # Compress image to prevent Streamlit Cloud errors
+            img = compress_image(uploaded_file, max_size_mb=3)
+            if img is not None:
                 source_type = "Uploaded file"
-        elif input_mode == "Camera":
-            if st.button("Capture Photo"):
-                camera_image = st.camera_input("Take Photo (laptop/mobile webcam)")
-                if camera_image:
-                    img = cv2.imdecode(np.frombuffer(camera_image.getvalue(), np.uint8), cv2.IMREAD_COLOR)
-                    source_type = "Captured photo"
+        
         if img is not None:
             with st.container():
                 st.markdown("#### Input Image Preview")
                 st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), caption=source_type, width=260)
         else:
-            st.info("Please upload or capture a leaf image to begin.")
+            st.info("Please upload a leaf image to begin.")
             st.stop()
+        
         # ===== PHASE 1: Leaf Segmentation (YOLO) =====
         with st.spinner("PHASE 1: Segmenting leaf (YOLO)..."):
             yolo_results = yolo_model(img)
@@ -266,6 +296,7 @@ def main():
                 return
             leaf_mask = yolo_results[0].masks.data.cpu().numpy()[0]
         st.success("✅ Phase 1 Complete: Leaf Segmentation")
+        
         # ===== PHASE 2: Disease Segmentation (UNet) =====
         with st.spinner("PHASE 2: Segmenting disease (UNet)..."):
             img_tensor = preprocess_image(img).unsqueeze(0).to(DEVICE)
@@ -274,9 +305,11 @@ def main():
                 pred_prob = torch.sigmoid(output)
                 pred_mask = (pred_prob > 0.5).float().cpu().squeeze().numpy()
         st.success("✅ Phase 2 Complete: Disease Segmentation")
-        # ===== PHASE 3: Severity Calculation + Disease Classification =====
+        
+        # ===== PHASE 3: Severity + Classification =====
         severity, severity_label, diseased_px, total_px = calculate_severity(pred_mask, leaf_mask)
         st.markdown(f"<h2 style='color:#d84315;'>Severity: {severity:.2f}% ({severity_label})</h2>", unsafe_allow_html=True)
+        
         disease_class, pred_confidence = "Unknown", 0.0
         if densenet_model is not None and class_names is not None:
             with st.spinner("PHASE 3: Classifying disease (DenseNet121)..."):
@@ -294,24 +327,27 @@ def main():
             st.markdown(f"<b>Model confidence:</b> {pred_confidence:.4f}")
             st.success("✅ Phase 3 Complete: Disease Classification")
         else:
-            st.warning("DenseNet model or class names not loaded. Classification skipped.")
-        # ===== PHASE 4: EXPERT SYSTEM INFERENCE ENGINE =====
-        with st.spinner("PHASE 4: Expert System Inference (KB Verification)..."):
+            st.warning("DenseNet model not loaded.")
+        
+        # ===== PHASE 4: EXPERT SYSTEM =====
+        with st.spinner("PHASE 4: Expert System Inference..."):
             expert_advice = phase4_expert_system_inference(disease_class, severity_label, knowledge_base)
         if "error" in expert_advice:
             st.warning(expert_advice["error"])
             return
         st.success("✅ Phase 4 Complete: Expert System Inference")
-        # ===== PHASE 5: RAG + FAISS + GEMINI =====
+        
+        # ===== PHASE 5: RAG + GEMINI =====
         with st.spinner("PHASE 5: RAG Retrieval (FAISS + Gemini LLM)..."):
             rag_context = phase5_rag_with_faiss(expert_advice, faiss_index, faiss_metadata, encoder)
             gemini_summary = generate_gemini_recommendation_phase5(expert_advice, rag_context, lang)
         st.success("✅ Phase 5 Complete: RAG + LLM Report")
-        # --- DISPLAY SHORT AI SUMMARY ---
-        st.header("🌱 Short AI Summary")
+        
+        # --- DISPLAY SUMMARY ---
+        st.header("🌱 AI Recommendation")
         st.markdown(gemini_summary)
-        # --- See Full Detailed System Report ---
-        with st.expander("See Full Detailed System Report"):
+        
+        with st.expander("See Full Detailed Report"):
             st.markdown(f"**Disease:** {expert_advice['disease_name']}")
             st.markdown(f"**Severity Level:** {expert_advice['severity_level']}")
             st.markdown(f"**Symptoms:** {expert_advice['symptoms']}")
@@ -324,8 +360,9 @@ def main():
             for idx, line in enumerate(expert_advice['prevention'].split(". ")):
                 if line.strip():
                     st.markdown(f"{idx+1}. {line.strip()}.")
-        # --- Segmentation Visualization ---
-        st.header("📊 Disease Prediction and Segmentation Visualization")
+        
+        # --- Visualization ---
+        st.header("📊 Disease Segmentation")
         fig, axes = plt.subplots(1, 4, figsize=(18, 6))
         image_vis = cv2.cvtColor(cv2.resize(img, (pred_mask.shape[1], pred_mask.shape[0])), cv2.COLOR_BGR2RGB)
         axes[0].imshow(image_vis); axes[0].set_title("Original Image"); axes[0].axis('off')
@@ -338,7 +375,8 @@ def main():
         axes[3].set_title(f"Overlay & Prediction\n{disease_class.replace('___', ' - ')}\n{severity:.2f}% ({severity_label})")
         axes[3].axis('off')
         st.pyplot(fig)
-        # --- Download Full Report ---
+        
+        # --- Download Report ---
         results = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "phase_1_segmentation": "Leaf segmented",
@@ -349,34 +387,31 @@ def main():
         }
         json_out = json.dumps(results, indent=2)
         st.download_button("⬇️ Download Full Report (JSON)", json_out, file_name="leafsense_analysis_report.json", mime="application/json")
+    
     else:
+        # ===== DISEASE EXPERT MODE =====
         st.header("💭 Disease Expert Advisor")
         st.markdown("---")
         st.markdown("### Ask About Any Plant Disease")
-        st.write("Describe the disease or symptoms you're concerned about. Our AI will search our database and provide expert recommendations.")
+        st.write("Describe the disease or symptoms. Our AI will search 42+ diseases and provide recommendations.")
         disease_query = st.text_area(
             "Describe your disease/symptom concern:",
-            placeholder="e.g., 'My tomato leaves have brown spots with yellow rings' or 'What is early blight?'",
+            placeholder="e.g., 'My tomato leaves have brown spots with yellow rings'",
             height=100
         )
         if st.button("🔍 Get Expert Recommendation", key="expert_btn"):
             if not disease_query.strip():
                 st.warning("Please describe a disease or symptom!")
             else:
-                with st.spinner("Searching database and generating recommendations..."):
+                with st.spinner("Searching database..."):
                     recommendation, matched_diseases = disease_expert_advisor(
-                        disease_query,
-                        faiss_index,
-                        faiss_metadata,
-                        encoder,
-                        knowledge_base,
-                        lang
+                        disease_query, faiss_index, faiss_metadata, encoder, knowledge_base, lang
                     )
                 st.success("✅ Expert Recommendation Generated!")
-                st.header("🌱 Short AI Summary")
+                st.header("🌱 Recommendation")
                 st.markdown(recommendation)
                 st.markdown("---")
-                st.header("📚 Top Matching Diseases in Database")
+                st.header("📚 Top Matching Diseases")
                 for i, disease in enumerate(matched_diseases, 1):
                     with st.expander(f"{i}. {disease['disease']}"):
                         st.markdown(f"**Symptoms:** {disease['symptoms']}")
