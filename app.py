@@ -17,16 +17,12 @@ import pickle
 import faiss
 import google.generativeai as genai
 from sentence_transformers import SentenceTransformer
-from PIL import Image
-import io
 import warnings
 warnings.filterwarnings('ignore')
 from datetime import datetime
 
-
 st.set_page_config(page_title="LeafSense: Disease Detection & Expert System", layout="wide")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 
 # ==== Gemini Key Setup ====
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"] if "GEMINI_API_KEY" in st.secrets else os.getenv("GEMINI_API_KEY")
@@ -36,18 +32,15 @@ if GEMINI_API_KEY is None:
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-2.5-flash')
 
-
 # --- Cache Loaders ---
 @st.cache_resource(show_spinner=True)
 def load_yolo_model(path): return YOLO(path)
-
 
 @st.cache_resource(show_spinner=True)
 def load_unet_model(path):
     m = smp.from_pretrained(path)
     m.to(DEVICE).eval()
     return m
-
 
 @st.cache_resource(show_spinner=True)
 def load_densenet_model(path):
@@ -67,10 +60,8 @@ def load_densenet_model(path):
         st.error(f"Model load error: {e}")
         return None
 
-
 @st.cache_data(show_spinner=True)
 def load_class_names(path): return np.load(path)
-
 
 @st.cache_data(show_spinner=True)
 def load_knowledge_base(path):
@@ -78,48 +69,18 @@ def load_knowledge_base(path):
         with open(path, 'r') as f: return json.load(f)
     except Exception: return {}
 
-
 @st.cache_resource(show_spinner=True)
 def load_faiss_index(index_path): return faiss.read_index(index_path)
-
 
 @st.cache_data(show_spinner=True)
 def load_faiss_metadata(metadata_path):
     with open(metadata_path, 'rb') as f: return pickle.load(f)
 
-
 @st.cache_resource(show_spinner=True)
 def load_encoder(): return SentenceTransformer('all-MiniLM-L6-v2')
 
-
 def normalize_class_name(name):
     return (name.replace(" ", "_").replace("-", "_").replace("__", "___").strip().lower())
-
-
-def compress_image(img_bytes):
-    """Compress large images to prevent upload errors (handles >5MB files)"""
-    try:
-        pil_img = Image.open(io.BytesIO(img_bytes))
-        
-        # Resize if too large
-        max_dim = 1280
-        if max(pil_img.size) > max_dim:
-            pil_img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
-        
-        # Compress to JPEG
-        compressed_io = io.BytesIO()
-        pil_img.save(compressed_io, format="JPEG", quality=85, optimize=True)
-        compressed_io.seek(0)
-        
-        # Convert to cv2 format
-        img_array = np.asarray(bytearray(compressed_io.read()), dtype=np.uint8)
-        cv2_img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-        
-        return cv2_img
-    except Exception as e:
-        st.error(f"Image compression error: {e}")
-        return None
-
 
 def phase4_expert_system_inference(disease_class, severity_label, knowledge_base):
     normalized_kb = {normalize_class_name(k): k for k in knowledge_base}
@@ -145,7 +106,6 @@ def phase4_expert_system_inference(disease_class, severity_label, knowledge_base
         "prevention": disease_info["prevention"]
     }
 
-
 def phase5_rag_with_faiss(expert_advice, faiss_index, faiss_metadata, encoder, top_k=2):
     query_text = f"{expert_advice['disease_name']} {expert_advice['symptoms']} {expert_advice['severity_level']}"
     query_vector = encoder.encode(query_text, convert_to_numpy=True).astype('float32').reshape(1, -1)
@@ -158,7 +118,6 @@ def phase5_rag_with_faiss(expert_advice, faiss_index, faiss_metadata, encoder, t
         "faiss_retrieved": supporting_context,
         "retrieval_quality": "High"
     }
-
 
 def disease_expert_advisor(disease_query, faiss_index, faiss_metadata, encoder, knowledge_base, lang="English"):
     query_vector = encoder.encode(disease_query, convert_to_numpy=True).astype('float32').reshape(1, -1)
@@ -173,6 +132,7 @@ def disease_expert_advisor(disease_query, faiss_index, faiss_metadata, encoder, 
             "prevention": metadata['prevention'],
             "severity_levels": metadata['severity_levels']
         })
+    # Generate concise Gemini advice
     prompt = (
         f"A farmer asked: \"{disease_query}\"\n"
         "Give only actionable info: Disease, Severity (if possible), Immediate action, Recommended pesticides, Prevention tips, When to act/treat, nothing more.\n"
@@ -196,8 +156,8 @@ def disease_expert_advisor(disease_query, faiss_index, faiss_metadata, encoder, 
         return t_response.text.strip() if hasattr(t_response, "text") else str(t_response), results
     return short_advice, results
 
-
 def generate_gemini_recommendation_phase5(expert_advice, rag_context, lang="English"):
+    # Short actionable summary prompt
     prompt = (
         f"ONLY use the expert-verified info below. Be extremely practical, keep it bullet style, show only: Disease, Severity, Immediate action, Recommended pesticides, Prevention tips, When to act/treat. Nothing else.\n"
         f"Disease: {expert_advice['disease_name']}\n"
@@ -219,7 +179,6 @@ def generate_gemini_recommendation_phase5(expert_advice, rag_context, lang="Engl
         return t_response.text.strip() if hasattr(t_response, "text") else str(t_response)
     return short_summary
 
-
 def preprocess_image(img, size=(256, 320)):
     transform = A.Compose([
         A.Resize(*size),
@@ -230,27 +189,17 @@ def preprocess_image(img, size=(256, 320)):
     augmented = transform(image=img_rgb)
     return augmented['image']
 
-
 def calculate_severity(disease_mask, leaf_mask):
-    """Calculate severity with disease detection check"""
     if leaf_mask.shape != disease_mask.shape:
         leaf_mask = resize(leaf_mask, disease_mask.shape, order=0, preserve_range=True, anti_aliasing=False)
         leaf_mask = (leaf_mask > 0.5).astype(np.uint8)
-    
     diseased_pixels = np.sum((disease_mask > 0) & (leaf_mask > 0))
     total_pixels = np.sum(leaf_mask > 0)
     severity = (diseased_pixels / total_pixels * 100) if total_pixels > 0 else 0
-    
-    # Determine severity label based on percentage
-    if severity < 10: 
-        label = "Mild"
-    elif severity < 30: 
-        label = "Moderate"
-    else: 
-        label = "Severe"
-    
+    if severity < 10: label = "Mild"
+    elif severity < 30: label = "Moderate"
+    else: label = "Severe"
     return severity, label, diseased_pixels, total_pixels
-
 
 def main():
     st.markdown(
@@ -293,20 +242,15 @@ def main():
         if input_mode == "Upload":
             uploaded_file = st.file_uploader("Upload Leaf Image", type=['jpg', 'jpeg', 'png'])
             if uploaded_file:
-                # Compress large images (>5MB)
-                img_bytes = uploaded_file.read()
-                img = compress_image(img_bytes)
-                if img is not None:
-                    source_type = "Uploaded file"
+                input_image_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+                img = cv2.imdecode(input_image_bytes, cv2.IMREAD_COLOR)
+                source_type = "Uploaded file"
         elif input_mode == "Camera":
             if st.button("Capture Photo"):
                 camera_image = st.camera_input("Take Photo (laptop/mobile webcam)")
                 if camera_image:
-                    # Compress camera image
-                    img_bytes = camera_image.getvalue()
-                    img = compress_image(img_bytes)
-                    if img is not None:
-                        source_type = "Captured photo"
+                    img = cv2.imdecode(np.frombuffer(camera_image.getvalue(), np.uint8), cv2.IMREAD_COLOR)
+                    source_type = "Captured photo"
         if img is not None:
             with st.container():
                 st.markdown("#### Input Image Preview")
@@ -322,8 +266,6 @@ def main():
                 return
             leaf_mask = yolo_results[0].masks.data.cpu().numpy()[0]
         st.success("✅ Phase 1 Complete: Leaf Segmentation")
-        leaf_pixels = np.sum(leaf_mask > 0)
-        
         # ===== PHASE 2: Disease Segmentation (UNet) =====
         with st.spinner("PHASE 2: Segmenting disease (UNet)..."):
             img_tensor = preprocess_image(img).unsqueeze(0).to(DEVICE)
@@ -332,20 +274,9 @@ def main():
                 pred_prob = torch.sigmoid(output)
                 pred_mask = (pred_prob > 0.5).float().cpu().squeeze().numpy()
         st.success("✅ Phase 2 Complete: Disease Segmentation")
-        disease_pixels = np.sum(pred_mask > 0)
-        
         # ===== PHASE 3: Severity Calculation + Disease Classification =====
         severity, severity_label, diseased_px, total_px = calculate_severity(pred_mask, leaf_mask)
-        
-        # Check if UNet actually detected disease
-        unet_detected_disease = disease_pixels > 10
-        
-        # Display severity with appropriate warning
-        if severity == 0 or not unet_detected_disease:
-            st.markdown(f"<h2 style='color:#FFA500;'>⚠️ Severity: {severity:.2f}% (No Disease Area Detected)</h2>", unsafe_allow_html=True)
-        else:
-            st.markdown(f"<h2 style='color:#d84315;'>Severity: {severity:.2f}% ({severity_label})</h2>", unsafe_allow_html=True)
-        
+        st.markdown(f"<h2 style='color:#d84315;'>Severity: {severity:.2f}% ({severity_label})</h2>", unsafe_allow_html=True)
         disease_class, pred_confidence = "Unknown", 0.0
         if densenet_model is not None and class_names is not None:
             with st.spinner("PHASE 3: Classifying disease (DenseNet121)..."):
@@ -361,11 +292,6 @@ def main():
                 pred_confidence = float(np.max(pred))
             st.markdown(f"<h3 style='color:#388e3c;'>Disease: {disease_class.replace('___', ' - ')}</h3>", unsafe_allow_html=True)
             st.markdown(f"<b>Model confidence:</b> {pred_confidence:.4f}")
-            
-            # Show warning if DenseNet detected disease but UNet found no disease area
-            if not unet_detected_disease and "healthy" not in disease_class.lower():
-                st.warning(f"⚠️ **Note:** Model classified as '{disease_class.replace('___', ' - ')}' but disease segmentation model couldn't find visible affected area. This suggests an **early-stage infection**.")
-            
             st.success("✅ Phase 3 Complete: Disease Classification")
         else:
             st.warning("DenseNet model or class names not loaded. Classification skipped.")
@@ -399,7 +325,7 @@ def main():
                 if line.strip():
                     st.markdown(f"{idx+1}. {line.strip()}.")
         # --- Segmentation Visualization ---
-        st.header("📊 Disease Prediction and Segmentation Visualization")
+        st.header("📊 Disease Prediction and Segmentation")
         fig, axes = plt.subplots(1, 4, figsize=(18, 6))
         image_vis = cv2.cvtColor(cv2.resize(img, (pred_mask.shape[1], pred_mask.shape[0])), cv2.COLOR_BGR2RGB)
         axes[0].imshow(image_vis); axes[0].set_title("Original Image"); axes[0].axis('off')
@@ -409,22 +335,15 @@ def main():
         overlay[(pred_mask > 0) & (resize(leaf_mask, pred_mask.shape, order=0, preserve_range=True, anti_aliasing=False) > 0)] = 1
         axes[3].imshow(image_vis)
         axes[3].imshow(overlay, cmap='autumn', alpha=0.5)
-        
-        # Adaptive title based on disease detection
-        if unet_detected_disease:
-            title_text = f"Overlay & Prediction\n{disease_class.replace('___', ' - ')}\n{severity:.2f}% ({severity_label})"
-        else:
-            title_text = f"Overlay: No Disease Area Found\n(Classified as: {disease_class.replace('___', ' - ')})"
-        
-        axes[3].set_title(title_text)
+        axes[3].set_title(f"Overlay & Prediction\n{disease_class.replace('___', ' - ')}\n{severity:.2f}% ({severity_label})")
         axes[3].axis('off')
         st.pyplot(fig)
         # --- Download Full Report ---
         results = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "phase_1_segmentation": {"status": "Leaf segmented", "leaf_pixels": int(leaf_pixels)},
-            "phase_2_disease_segmentation": {"status": "Disease area identified", "disease_pixels": int(disease_pixels), "unet_detected": bool(unet_detected_disease)},
-            "phase_3_classification": {"disease": disease_class, "confidence": pred_confidence, "severity": severity_label, "severity_percent": severity},
+            "phase_1_segmentation": "Leaf segmented",
+            "phase_2_disease_segmentation": "Disease area identified",
+            "phase_3_classification": {"disease": disease_class, "confidence": pred_confidence, "severity": severity_label},
             "phase_4_expert_inference": expert_advice,
             "phase_5_rag_output": {"gemini_summary": gemini_summary, "language": lang},
         }
@@ -464,7 +383,6 @@ def main():
                         st.markdown(f"**Pesticides:** {disease['pesticides']}")
                         st.markdown(f"**Prevention:** {disease['prevention']}")
                         st.markdown(f"**Severity Levels:** {', '.join(disease['severity_levels'])}")
-
 
 if __name__ == "__main__":
     main()
