@@ -245,59 +245,92 @@ def main():
                 input_image_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
                 img = cv2.imdecode(input_image_bytes, cv2.IMREAD_COLOR)
                 source_type = "Uploaded file"
-        elif input_mode == "Camera":
-            st.markdown("### 📸 Camera Input")
+elif input_mode == "Camera":
+    st.markdown("### 📸 Camera Input")
 
-            st.info("📱 On mobile: You can switch between front and back cameras using the dropdown below.")
+    st.info("📱 On mobile: Select which camera to use below before capturing the image.")
 
-            # --- Select camera type (front or back) ---
-            camera_option = st.selectbox(
-                "Select Camera:",
-                ["Rear Camera (Back)", "Front Camera"],
-                index=0,
-                help="Select which camera to use when capturing an image"
-            )
+    # Camera selector (front or back)
+    camera_option = st.selectbox(
+        "Select Camera:",
+        ["Rear Camera (Back)", "Front Camera"],
+        index=0,
+        help="Choose which camera to use"
+    )
 
-            # --- Custom camera component using streamlit-webrtc ---
-            # st.camera_input() doesn’t support back camera selection directly,
-            # so we use an HTML/JS snippet as fallback for mobile browsers.
-            st.markdown(
-                """
-                <style>
-                video, canvas { width: 100% !important; border-radius: 10px; }
-                </style>
-                """,
-                unsafe_allow_html=True,
-            )
+    import streamlit.components.v1 as components
 
-            import streamlit.components.v1 as components
+    # Custom camera input using HTML5 + JS (facingMode = environment/user)
+    js_camera = f"""
+    <style>
+      video, canvas {{
+        width: 100% !important;
+        border-radius: 10px;
+        background-color: #000;
+      }}
+      button {{
+        margin-top: 10px;
+        padding: 8px 16px;
+        border: none;
+        border-radius: 8px;
+        background-color: #4CAF50;
+        color: white;
+        font-size: 16px;
+      }}
+      button:hover {{
+        background-color: #45a049;
+      }}
+    </style>
 
-            js_camera = f"""
-            <video id="camera" autoplay playsinline></video>
-            <script>
-            async function startCamera() {{
-                const facingMode = {"'environment'" if camera_option.startswith("Rear") else "'user'"};
-                const constraints = {{ video: {{ facingMode }} }};
-                try {{
-                    const stream = await navigator.mediaDevices.getUserMedia(constraints);
-                    const video = document.getElementById('camera');
-                    video.srcObject = stream;
-                }} catch (err) {{
-                    console.error('Camera access error:', err);
-                }}
-            }}
-            startCamera();
-            </script>
-            """
+    <video id="camera" autoplay playsinline></video>
+    <canvas id="snapshot" style="display:none;"></canvas>
+    <button id="capture">Capture Photo</button>
+    <script>
+    const video = document.getElementById('camera');
+    const canvas = document.getElementById('snapshot');
+    const captureButton = document.getElementById('capture');
 
-            components.html(js_camera, height=300)
+    async function startCamera() {{
+        const facingMode = {"'environment'" if camera_option.startswith("Rear") else "'user'"};
+        try {{
+            const stream = await navigator.mediaDevices.getUserMedia({{ video: {{ facingMode: facingMode }} }});
+            video.srcObject = stream;
+        }} catch (err) {{
+            console.error("Camera access error:", err);
+        }}
+    }}
 
-            if camera_image:
-                # Compress camera image
-                img_bytes = camera_image.getvalue()
-                img = compress_image(img_bytes)
-                if img is not None:
-                    source_type = "Captured photo"
+    captureButton.onclick = () => {{
+        const context = canvas.getContext('2d');
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        context.drawImage(video, 0, 0);
+        const dataUrl = canvas.toDataURL('image/jpeg');
+        window.parent.postMessage({{ type: 'camera_capture', data: dataUrl }}, '*');
+    }};
+
+    startCamera();
+    </script>
+    """
+
+    components.html(js_camera, height=400)
+
+    # Receive image from JavaScript postMessage
+    from streamlit_js_eval import streamlit_js_eval
+    data_url = streamlit_js_eval(js_expressions="window.dataUrl", key="camera-capture", default_value=None)
+
+    img = None
+    if data_url:
+        import base64
+        from io import BytesIO
+        from PIL import Image
+
+        img_bytes = base64.b64decode(data_url.split(",")[1])
+        img = compress_image(img_bytes)
+        if img is not None:
+            source_type = "Captured photo"
+            st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), caption=source_type, width=260)
+
 
         if img is not None:
             with st.container():
