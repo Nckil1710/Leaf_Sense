@@ -227,9 +227,12 @@ def calculate_severity(disease_mask, leaf_mask):
     diseased_pixels = np.sum((disease_mask > 0) & (leaf_mask > 0))
     total_pixels = np.sum(leaf_mask > 0)
     severity = (diseased_pixels / total_pixels * 100) if total_pixels > 0 else 0
+    
+    # Determine severity label
     if severity < 10: label = "Mild"
     elif severity < 30: label = "Moderate"
     else: label = "Severe"
+    
     return severity, label, diseased_pixels, total_pixels
 
 def main():
@@ -284,6 +287,7 @@ def main():
                     source_type = "Uploaded file"
         
         elif input_mode == "📸 Take Photo with Camera":
+            # Camera loads ONLY when this option is selected
             camera_image = st.camera_input("Take a photo of your leaf")
             if camera_image:
                 try:
@@ -325,6 +329,8 @@ def main():
                 return
             leaf_mask = yolo_results[0].masks.data.cpu().numpy()[0]
         st.success("✅ Phase 1 Complete: Leaf Segmentation")
+        leaf_pixels = np.sum(leaf_mask > 0)
+        st.caption(f"📊 Leaf pixels detected: {leaf_pixels}")
         
         # ===== PHASE 2: Disease Segmentation (UNet) =====
         with st.spinner("PHASE 2: Segmenting disease (UNet)..."):
@@ -334,10 +340,20 @@ def main():
                 pred_prob = torch.sigmoid(output)
                 pred_mask = (pred_prob > 0.5).float().cpu().squeeze().numpy()
         st.success("✅ Phase 2 Complete: Disease Segmentation")
+        disease_pixels = np.sum(pred_mask > 0)
+        st.caption(f"📊 Disease pixels detected: {disease_pixels}")
         
-        # ===== PHASE 3: Severity + Classification =====
+        # ===== PHASE 3: Severity Calculation + Disease Classification =====
         severity, severity_label, diseased_px, total_px = calculate_severity(pred_mask, leaf_mask)
-        st.markdown(f"<h2 style='color:#d84315;'>Severity: {severity:.2f}% ({severity_label})</h2>", unsafe_allow_html=True)
+        
+        # Check if disease was actually detected by UNet
+        unet_detected_disease = disease_pixels > 10  # At least 10 pixels of disease
+        
+        if severity == 0 or not unet_detected_disease:
+            st.markdown(f"<h2 style='color:#FFA500;'>⚠️ Severity: {severity:.2f}% (No Disease Area Detected)</h2>", unsafe_allow_html=True)
+            st.info("💡 **Note:** Disease segmentation model couldn't find visible disease area. This may indicate an early-stage infection or a healthy leaf. Classification below is based on leaf visual features.")
+        else:
+            st.markdown(f"<h2 style='color:#d84315;'>Severity: {severity:.2f}% ({severity_label})</h2>", unsafe_allow_html=True)
         
         disease_class, pred_confidence = "Unknown", 0.0
         if densenet_model is not None and class_names is not None:
@@ -352,8 +368,13 @@ def main():
                 pred_class = np.argmax(pred, axis=1)[0]
                 disease_class = class_names[pred_class]
                 pred_confidence = float(np.max(pred))
-            st.markdown(f"<h3 style='color:#388e3c;'>Disease: {disease_class.replace('___', ' - ')}</h3>", unsafe_allow_html=True)
+            st.markdown(f"<h3 style='color:#388e3c;'>Classified as: {disease_class.replace('___', ' - ')}</h3>", unsafe_allow_html=True)
             st.markdown(f"<b>Model confidence:</b> {pred_confidence:.4f}")
+            
+            # Show warning if DenseNet detected disease but UNet didn't
+            if not unet_detected_disease and "healthy" not in disease_class.lower():
+                st.warning(f"⚠️ **Important:** Model classified as '{disease_class.replace('___', ' - ')}' but disease segmentation couldn't find visible affected area. This suggests an **early-stage infection**. Monitor the plant closely.")
+            
             st.success("✅ Phase 3 Complete: Disease Classification")
         else:
             st.warning("DenseNet model not loaded.")
@@ -391,7 +412,7 @@ def main():
                     st.markdown(f"{idx+1}. {line.strip()}.")
         
         # --- Visualization ---
-        st.header("📊 Disease Segmentation")
+        st.header("📊 Disease Segmentation Analysis")
         fig, axes = plt.subplots(1, 4, figsize=(18, 6))
         image_vis = cv2.cvtColor(cv2.resize(img, (pred_mask.shape[1], pred_mask.shape[0])), cv2.COLOR_BGR2RGB)
         axes[0].imshow(image_vis); axes[0].set_title("Original Image"); axes[0].axis('off')
@@ -401,18 +422,26 @@ def main():
         overlay[(pred_mask > 0) & (resize(leaf_mask, pred_mask.shape, order=0, preserve_range=True, anti_aliasing=False) > 0)] = 1
         axes[3].imshow(image_vis)
         axes[3].imshow(overlay, cmap='autumn', alpha=0.5)
-        axes[3].set_title(f"Overlay & Prediction\n{disease_class.replace('___', ' - ')}\n{severity:.2f}% ({severity_label})")
+        
+        # Title for overlay showing detection status
+        if unet_detected_disease:
+            title_text = f"Overlay & Prediction\n{disease_class.replace('___', ' - ')}\n{severity:.2f}% ({severity_label})"
+        else:
+            title_text = f"Overlay: No Disease Area Found\n(Classified as: {disease_class.replace('___', ' - ')})\nSeverity: 0% (Early-stage or Healthy)"
+        
+        axes[3].set_title(title_text)
         axes[3].axis('off')
         st.pyplot(fig)
         
         # --- Download Report ---
         results = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "phase_1_segmentation": "Leaf segmented",
-            "phase_2_disease_segmentation": "Disease area identified",
-            "phase_3_classification": {"disease": disease_class, "confidence": pred_confidence, "severity": severity_label},
+            "phase_1_segmentation": {"status": "Leaf segmented", "leaf_pixels": int(leaf_pixels)},
+            "phase_2_disease_segmentation": {"status": "Disease area identified", "disease_pixels": int(disease_pixels), "unet_detected": bool(unet_detected_disease)},
+            "phase_3_classification": {"disease": disease_class, "confidence": pred_confidence, "severity": severity_label, "severity_percent": severity},
             "phase_4_expert_inference": expert_advice,
             "phase_5_rag_output": {"gemini_summary": gemini_summary, "language": lang},
+            "analysis_notes": "If disease was classified but severity is 0%, this indicates early-stage infection or the UNet model couldn't segment visible disease area."
         }
         json_out = json.dumps(results, indent=2)
         st.download_button("⬇️ Download Full Report (JSON)", json_out, file_name="leafsense_analysis_report.json", mime="application/json")
