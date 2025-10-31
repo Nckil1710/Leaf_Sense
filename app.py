@@ -300,15 +300,19 @@ def main():
                 img = compress_image(img_bytes)
                 if img is not None:
                     source_type = "Uploaded file"
-        elif input_mode == "Camera":
-            if st.button("Capture Photo"):
-                camera_image = st.camera_input("Take Photo (laptop/mobile webcam)")
-                if camera_image:
-                    # Compress camera image
-                    img_bytes = camera_image.getvalue()
-                    img = compress_image(img_bytes)
-                    if img is not None:
-                        source_type = "Captured photo"
+                elif input_mode == "Camera":
+                    st.markdown("### 📸 Camera Input")
+                    st.info("📱 On mobile: Tap the camera icon in the top-right corner of the preview to switch between front/back cameras")
+                    
+                    camera_image = st.camera_input("Take Photo with your camera")
+                    
+                    if camera_image:
+                        # Compress camera image
+                        img_bytes = camera_image.getvalue()
+                        img = compress_image(img_bytes)
+                        if img is not None:
+                            source_type = "Captured photo"
+
         if img is not None:
             with st.container():
                 st.markdown("#### Input Image Preview")
