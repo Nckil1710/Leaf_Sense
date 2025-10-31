@@ -22,7 +22,6 @@ warnings.filterwarnings('ignore')
 from datetime import datetime
 
 st.set_page_config(page_title="LeafSense: Disease Detection & Expert System", layout="wide")
-
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ==== Gemini Key Setup ====
@@ -33,14 +32,16 @@ if GEMINI_API_KEY is None:
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-2.5-flash')
 
-# --- CACHE LOADERS ---
+# --- Cache Loaders ---
 @st.cache_resource(show_spinner=True)
 def load_yolo_model(path): return YOLO(path)
+
 @st.cache_resource(show_spinner=True)
 def load_unet_model(path):
     m = smp.from_pretrained(path)
     m.to(DEVICE).eval()
     return m
+
 @st.cache_resource(show_spinner=True)
 def load_densenet_model(path):
     class DummyCast(tf.keras.layers.Layer):
@@ -58,36 +59,32 @@ def load_densenet_model(path):
     except Exception as e:
         st.error(f"Model load error: {e}")
         return None
+
 @st.cache_data(show_spinner=True)
 def load_class_names(path): return np.load(path)
+
 @st.cache_data(show_spinner=True)
 def load_knowledge_base(path):
     try:
         with open(path, 'r') as f: return json.load(f)
     except Exception: return {}
+
 @st.cache_resource(show_spinner=True)
 def load_faiss_index(index_path): return faiss.read_index(index_path)
+
 @st.cache_data(show_spinner=True)
 def load_faiss_metadata(metadata_path):
     with open(metadata_path, 'rb') as f: return pickle.load(f)
+
 @st.cache_resource(show_spinner=True)
 def load_encoder(): return SentenceTransformer('all-MiniLM-L6-v2')
 
 def normalize_class_name(name):
     return (name.replace(" ", "_").replace("-", "_").replace("__", "___").strip().lower())
 
-# ============ PHASE 4: EXPERT SYSTEM INFERENCE ENGINE ============
 def phase4_expert_system_inference(disease_class, severity_label, knowledge_base):
-    """
-    Phase 4: Expert System Inference Engine
-    - Takes P1-P3 outputs (disease_class from DenseNet, severity_label from UNet)
-    - Verifies against Knowledge Base
-    - Returns expert system output (ground truth)
-    - Avoids hallucination by strictly following KB
-    """
     normalized_kb = {normalize_class_name(k): k for k in knowledge_base}
     lookup_key = normalize_class_name(disease_class)
-    
     if lookup_key not in normalized_kb:
         similar = [k for k in knowledge_base if disease_class.replace(" ", "_") in k]
         return {"error": f"Disease '{disease_class}' not found. Did you mean: {similar[:3]}?"}
@@ -99,7 +96,6 @@ def phase4_expert_system_inference(disease_class, severity_label, knowledge_base
     if severity_label not in disease_info["severity_identification"]:
         return {"error": f"Severity '{severity_label}' not recognized.", "valid_severities": list(disease_info["severity_identification"].keys())}
     
-    # Ground truth from KB
     return {
         "disease_name": actual_key.replace("___", " - ").replace("_", " "),
         "severity_level": severity_label.upper(),
@@ -110,47 +106,22 @@ def phase4_expert_system_inference(disease_class, severity_label, knowledge_base
         "prevention": disease_info["prevention"]
     }
 
-# ============ PHASE 5: RAG + FAISS VECTOR STORE + GEMINI LLM ============
 def phase5_rag_with_faiss(expert_advice, faiss_index, faiss_metadata, encoder, top_k=2):
-    """
-    Phase 5: RAG Advisory (using FAISS Vector Store + Gemini LLM)
-    - Takes expert system output as ground truth
-    - Retrieves similar diseases from FAISS for supporting context
-    - Uses Gemini LLM to synthesize final comprehensive report
-    - Grounded by expert system output (avoids hallucination)
-    """
-    # Create query from expert advice
     query_text = f"{expert_advice['disease_name']} {expert_advice['symptoms']} {expert_advice['severity_level']}"
     query_vector = encoder.encode(query_text, convert_to_numpy=True).astype('float32').reshape(1, -1)
-    
-    # Search FAISS
     distances, indices = faiss_index.search(query_vector, top_k)
-    
     supporting_context = []
     for idx in indices[0]:
         supporting_context.append(faiss_metadata[idx])
-    
     return {
         "expert_system_output": expert_advice,
         "faiss_retrieved": supporting_context,
         "retrieval_quality": "High"
     }
 
-# ============ DISEASE EXPERT ADVISOR (NEW FEATURE) ============
 def disease_expert_advisor(disease_query, faiss_index, faiss_metadata, encoder, knowledge_base, lang="English"):
-    """
-    NEW FEATURE: Farmer asks about a specific disease
-    - Searches FAISS for similar diseases
-    - Retrieves from KB
-    - Generates expert recommendations using Gemini
-    - No image needed, pure text-based consultation
-    """
-    # Encode query
     query_vector = encoder.encode(disease_query, convert_to_numpy=True).astype('float32').reshape(1, -1)
-    
-    # Search FAISS (get top 3 closest matches)
     distances, indices = faiss_index.search(query_vector, k=3)
-    
     results = []
     for idx in indices[0]:
         metadata = faiss_metadata[idx]
@@ -161,81 +132,52 @@ def disease_expert_advisor(disease_query, faiss_index, faiss_metadata, encoder, 
             "prevention": metadata['prevention'],
             "severity_levels": metadata['severity_levels']
         })
-    
-    # Generate recommendation using Gemini
-    prompt = f"""
-You are an agricultural disease expert. A farmer asked: "{disease_query}"
-
-Based on the following disease information from our database, provide clear, practical advice:
-
-TOP MATCHING DISEASES:
-"""
-    
+    # Generate concise Gemini advice
+    prompt = (
+        f"A farmer asked: \"{disease_query}\"\n"
+        "Give only actionable info: Disease, Severity (if possible), Immediate action, Recommended pesticides, Prevention tips, When to act/treat, nothing more.\n"
+        "Here are top matching database entries:\n"
+    )
     for i, result in enumerate(results, 1):
-        prompt += f"""
-{i}. Disease: {result['disease']}
-   Symptoms: {result['symptoms']}
-   Pesticides: {result['pesticides']}
-   Prevention: {result['prevention']}
-"""
-    
-    prompt += """
-
-Provide:
-1. Which disease best matches the farmer's query
-2. Clear symptoms to look for
-3. Recommended pesticides/treatments
-4. Prevention measures
-5. When to apply treatments
-
-Be practical and farmer-friendly. Use simple language.
-"""
-    
+        prompt += (
+            f"{i}. Disease: {result['disease']}\n"
+            f"   Symptoms: {result['symptoms']}\n"
+            f"   Pesticides: {result['pesticides']}\n"
+            f"   Prevention: {result['prevention']}\n"
+        )
     response = model.generate_content(prompt)
-    english_advice = response.text.strip() if hasattr(response, "text") else str(response)
-    
+    short_advice = response.text.strip() if hasattr(response, "text") else str(response)
     if lang == "Telugu":
         telugu_prompt = (
-            "Translate this expert advice into very clear spoken Telugu, super simple, ONLY Telugu (no English). Keep the structure:\n\n"
-            + english_advice
+            "Translate into clear spoken Telugu, only actionable, short advice, nothing extra or technical:\n\n"
+            + short_advice
         )
         t_response = model.generate_content(telugu_prompt)
         return t_response.text.strip() if hasattr(t_response, "text") else str(t_response), results
-    
-    return english_advice, results
+    return short_advice, results
 
 def generate_gemini_recommendation_phase5(expert_advice, rag_context, lang="English"):
-    """
-    Generate final recommendation using Gemini, grounded by expert system output.
-    """
-    prompt = f"""
-You are an expert agricultural AI assistant.
-ONLY use the expert-verified information below. Do NOT hallucinate or add external knowledge!
-
-EXPERT SYSTEM VERIFIED (GROUND TRUTH):
-Disease: {expert_advice['disease_name']}
-Severity: {expert_advice['severity_level']}
-Symptoms: {expert_advice['symptoms']}
-Severity Description: {expert_advice['severity_description']}
-Pesticides: {expert_advice['pesticides']}
-Treatment: {expert_advice['treatment']}
-Prevention: {expert_advice['prevention']}
-
-Summarize this for a farmer in clear, line-by-line format.
-- Be extremely practical and brief. Use easy language.
-- Sections: Disease | Severity | Symptoms | Severity Description | Pesticides | Treatment | Prevention
-"""
+    # Short actionable summary prompt
+    prompt = (
+        f"ONLY use the expert-verified info below. Be extremely practical, keep it bullet style, show only: Disease, Severity, Immediate action, Recommended pesticides, Prevention tips, When to act/treat. Nothing else.\n"
+        f"Disease: {expert_advice['disease_name']}\n"
+        f"Severity: {expert_advice['severity_level']}\n"
+        f"Symptoms: {expert_advice['symptoms']}\n"
+        f"Severity Description: {expert_advice['severity_description']}\n"
+        f"Pesticides: {expert_advice['pesticides']}\n"
+        f"Treatment: {expert_advice['treatment']}\n"
+        f"Prevention: {expert_advice['prevention']}\n"
+    )
     response = model.generate_content(prompt)
-    summary_english = response.text.strip() if hasattr(response, "text") else str(response)
-    
+    short_summary = response.text.strip() if hasattr(response, "text") else str(response)
     if lang == "Telugu":
         telugu_prompt = (
-            "Translate this farmer advice into very clear spoken Telugu, super simple, ONLY Telugu (no English). Line-by-line:\n\n"
-            + summary_english
+            "Translate into clear spoken Telugu, only actionable, short advice, nothing extra:\n\n"
+            + short_summary
         )
         t_response = model.generate_content(telugu_prompt)
         return t_response.text.strip() if hasattr(t_response, "text") else str(t_response)
-    return summary_english
+    return short_summary
 
 def preprocess_image(img, size=(256, 320)):
     transform = A.Compose([
@@ -264,13 +206,10 @@ def main():
         "<h1 style='text-align: center; color: #1976d2;'>🌿 LeafSense Disease Detection & Expert System</h1>",
         unsafe_allow_html=True
     )
-    
-    # --- SIDEBAR INSTRUCTIONS & MODE SELECTION ---
     with st.sidebar:
         st.markdown("## 🌱 Welcome to LeafSense!")
         st.markdown("### Choose Your Mode:")
         mode = st.radio("What would you like to do?", ["Image Detection", "Ask Disease Expert"])
-        
         if mode == "Image Detection":
             st.markdown("#### 📸 Image Detection Mode")
             st.write(
@@ -287,10 +226,7 @@ def main():
                 "- Get expert recommendations without needing a leaf photo!\n"
                 "- Perfect for farmers with specific disease questions."
             )
-
     lang = st.selectbox("Choose Output Language:", ["English", "Telugu"])
-
-    # --- LOAD ALL MODELS & DATA AT START ---
     with st.spinner("Loading models & FAISS index..."):
         yolo_model = load_yolo_model("leafsense_best.pt")
         unet_model = load_unet_model("best_weights.pth")
@@ -300,12 +236,9 @@ def main():
         faiss_index = load_faiss_index("faiss_index.bin")
         faiss_metadata = load_faiss_metadata("faiss_metadata.pkl")
         encoder = load_encoder()
-
-    # ============ MODE 1: IMAGE DETECTION ============
     if mode == "Image Detection":
         input_mode = st.radio("How would you like to add your leaf photo?", ["Upload", "Camera"])
         img, source_type = None, None
-        
         if input_mode == "Upload":
             uploaded_file = st.file_uploader("Upload Leaf Image", type=['jpg', 'jpeg', 'png'])
             if uploaded_file:
@@ -318,7 +251,6 @@ def main():
                 if camera_image:
                     img = cv2.imdecode(np.frombuffer(camera_image.getvalue(), np.uint8), cv2.IMREAD_COLOR)
                     source_type = "Captured photo"
-
         if img is not None:
             with st.container():
                 st.markdown("#### Input Image Preview")
@@ -326,7 +258,6 @@ def main():
         else:
             st.info("Please upload or capture a leaf image to begin.")
             st.stop()
-
         # ===== PHASE 1: Leaf Segmentation (YOLO) =====
         with st.spinner("PHASE 1: Segmenting leaf (YOLO)..."):
             yolo_results = yolo_model(img)
@@ -335,7 +266,6 @@ def main():
                 return
             leaf_mask = yolo_results[0].masks.data.cpu().numpy()[0]
         st.success("✅ Phase 1 Complete: Leaf Segmentation")
-
         # ===== PHASE 2: Disease Segmentation (UNet) =====
         with st.spinner("PHASE 2: Segmenting disease (UNet)..."):
             img_tensor = preprocess_image(img).unsqueeze(0).to(DEVICE)
@@ -344,11 +274,9 @@ def main():
                 pred_prob = torch.sigmoid(output)
                 pred_mask = (pred_prob > 0.5).float().cpu().squeeze().numpy()
         st.success("✅ Phase 2 Complete: Disease Segmentation")
-
         # ===== PHASE 3: Severity Calculation + Disease Classification =====
         severity, severity_label, diseased_px, total_px = calculate_severity(pred_mask, leaf_mask)
         st.markdown(f"<h2 style='color:#d84315;'>Severity: {severity:.2f}% ({severity_label})</h2>", unsafe_allow_html=True)
-
         disease_class, pred_confidence = "Unknown", 0.0
         if densenet_model is not None and class_names is not None:
             with st.spinner("PHASE 3: Classifying disease (DenseNet121)..."):
@@ -367,28 +295,22 @@ def main():
             st.success("✅ Phase 3 Complete: Disease Classification")
         else:
             st.warning("DenseNet model or class names not loaded. Classification skipped.")
-
         # ===== PHASE 4: EXPERT SYSTEM INFERENCE ENGINE =====
         with st.spinner("PHASE 4: Expert System Inference (KB Verification)..."):
             expert_advice = phase4_expert_system_inference(disease_class, severity_label, knowledge_base)
-        
         if "error" in expert_advice:
             st.warning(expert_advice["error"])
             return
         st.success("✅ Phase 4 Complete: Expert System Inference")
-
         # ===== PHASE 5: RAG + FAISS + GEMINI =====
         with st.spinner("PHASE 5: RAG Retrieval (FAISS + Gemini LLM)..."):
             rag_context = phase5_rag_with_faiss(expert_advice, faiss_index, faiss_metadata, encoder)
             gemini_summary = generate_gemini_recommendation_phase5(expert_advice, rag_context, lang)
         st.success("✅ Phase 5 Complete: RAG + LLM Report")
-
-        # --- DISPLAY SUMMARY ---
-        st.header("🌱 Short AI Summary (Line by Line)")
-        for line in gemini_summary.strip().splitlines():
-            if line.strip():
-                st.markdown(f"- {line.strip()}")
-
+        # --- DISPLAY SHORT AI SUMMARY ---
+        st.header("🌱 Short AI Summary")
+        st.markdown(gemini_summary)
+        # --- See Full Detailed System Report ---
         with st.expander("See Full Detailed System Report"):
             st.markdown(f"**Disease:** {expert_advice['disease_name']}")
             st.markdown(f"**Severity Level:** {expert_advice['severity_level']}")
@@ -402,9 +324,8 @@ def main():
             for idx, line in enumerate(expert_advice['prevention'].split(". ")):
                 if line.strip():
                     st.markdown(f"{idx+1}. {line.strip()}.")
-
-        # --- Visualization ---
-        st.header("📊 Segmentation Visualization")
+        # --- Segmentation Visualization ---
+        st.header("📊 Disease Prediction and Segmentation Visualization")
         fig, axes = plt.subplots(1, 4, figsize=(18, 6))
         image_vis = cv2.cvtColor(cv2.resize(img, (pred_mask.shape[1], pred_mask.shape[0])), cv2.COLOR_BGR2RGB)
         axes[0].imshow(image_vis); axes[0].set_title("Original Image"); axes[0].axis('off')
@@ -417,7 +338,7 @@ def main():
         axes[3].set_title(f"Overlay & Prediction\n{disease_class.replace('___', ' - ')}\n{severity:.2f}% ({severity_label})")
         axes[3].axis('off')
         st.pyplot(fig)
-
+        # --- Download Full Report ---
         results = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "phase_1_segmentation": "Leaf segmented",
@@ -428,22 +349,16 @@ def main():
         }
         json_out = json.dumps(results, indent=2)
         st.download_button("⬇️ Download Full Report (JSON)", json_out, file_name="leafsense_analysis_report.json", mime="application/json")
-
-    # ============ MODE 2: DISEASE EXPERT ADVISOR (NEW FEATURE) ============
     else:
         st.header("💭 Disease Expert Advisor")
         st.markdown("---")
-        
         st.markdown("### Ask About Any Plant Disease")
         st.write("Describe the disease or symptoms you're concerned about. Our AI will search our database and provide expert recommendations.")
-        
-        # Input field
         disease_query = st.text_area(
             "Describe your disease/symptom concern:",
             placeholder="e.g., 'My tomato leaves have brown spots with yellow rings' or 'What is early blight?'",
             height=100
         )
-        
         if st.button("🔍 Get Expert Recommendation", key="expert_btn"):
             if not disease_query.strip():
                 st.warning("Please describe a disease or symptom!")
@@ -457,15 +372,11 @@ def main():
                         knowledge_base,
                         lang
                     )
-                
                 st.success("✅ Expert Recommendation Generated!")
-                
-                st.header("🌱 Expert Advice")
+                st.header("🌱 Short AI Summary")
                 st.markdown(recommendation)
-                
                 st.markdown("---")
                 st.header("📚 Top Matching Diseases in Database")
-                
                 for i, disease in enumerate(matched_diseases, 1):
                     with st.expander(f"{i}. {disease['disease']}"):
                         st.markdown(f"**Symptoms:** {disease['symptoms']}")
