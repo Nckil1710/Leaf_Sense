@@ -292,10 +292,6 @@ def main():
 
             components.html(js_camera, height=300)
 
-            # --- Capture image using normal st.camera_input as fallback (for desktops) ---
-            st.markdown("#### Or capture using Streamlit camera (desktop fallback):")
-            camera_image = st.camera_input("Take a photo")
-
             if camera_image:
                 # Compress camera image
                 img_bytes = camera_image.getvalue()
