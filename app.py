@@ -244,10 +244,10 @@ def main():
         if mode == "Image Detection":
             st.markdown("#### 📸 Image Detection Mode")
             st.write(
-                "- Upload a **clear, full photo** of a single leaf.\n"
+                "- Upload a clear leaf photo from gallery, or take one with your camera.\n"
+                "- Leaf should be visible edge-to-edge, well-lit, no shadows.\n"
                 "- Max 3MB recommended for smooth upload.\n"
-                "- Leaf should be visible, well-lit, no shadows.\n"
-                "- Desktop: upload file. Mobile: select from gallery."
+                "- Works on desktop, mobile, and tablets!"
             )
         else:
             st.markdown("#### 💭 Disease Expert Mode")
@@ -269,23 +269,52 @@ def main():
         encoder = load_encoder()
     
     if mode == "Image Detection":
-        # ===== UPLOAD ONLY (no camera to avoid 400 error) =====
+        # ===== UPLOAD AND CAMERA OPTIONS =====
         st.markdown("### Upload Your Leaf Image")
-        uploaded_file = st.file_uploader("Select leaf image from gallery", type=['jpg', 'jpeg', 'png'])
+        
+        input_mode = st.radio("Choose input method:", ["📱 Upload from Gallery", "📸 Take Photo with Camera"])
         
         img, source_type = None, None
-        if uploaded_file:
-            # Compress image to prevent Streamlit Cloud errors
-            img = compress_image(uploaded_file, max_size_mb=3)
-            if img is not None:
-                source_type = "Uploaded file"
+        
+        if input_mode == "📱 Upload from Gallery":
+            uploaded_file = st.file_uploader("Select leaf image", type=['jpg', 'jpeg', 'png'])
+            if uploaded_file:
+                img = compress_image(uploaded_file, max_size_mb=3)
+                if img is not None:
+                    source_type = "Uploaded file"
+        
+        elif input_mode == "📸 Take Photo with Camera":
+            camera_image = st.camera_input("Take a photo of your leaf")
+            if camera_image:
+                try:
+                    # Convert camera image to PIL for compression
+                    pil_img = Image.open(camera_image)
+                    
+                    # Resize if too large
+                    max_dim = 1280
+                    if max(pil_img.size) > max_dim:
+                        pil_img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+                    
+                    # Compress to JPEG
+                    img_bytes_io = io.BytesIO()
+                    pil_img.save(img_bytes_io, format="JPEG", quality=80, optimize=True)
+                    img_bytes_io.seek(0)
+                    
+                    # Convert to cv2 format
+                    img_array = np.asarray(bytearray(img_bytes_io.read()), dtype=np.uint8)
+                    img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                    
+                    if img is not None:
+                        source_type = "Captured photo"
+                except Exception as e:
+                    st.error(f"Camera image processing error: {e}")
         
         if img is not None:
             with st.container():
                 st.markdown("#### Input Image Preview")
                 st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), caption=source_type, width=260)
         else:
-            st.info("Please upload a leaf image to begin.")
+            st.info("Please upload or capture a leaf image to begin.")
             st.stop()
         
         # ===== PHASE 1: Leaf Segmentation (YOLO) =====
