@@ -1,6 +1,4 @@
-# app.py (updated: mobile-first capture + immediate preview)
 import streamlit as st
-import streamlit.components.v1 as components
 import torch
 import segmentation_models_pytorch as smp
 from ultralytics import YOLO
@@ -22,9 +20,6 @@ from sentence_transformers import SentenceTransformer
 import warnings
 warnings.filterwarnings('ignore')
 from datetime import datetime
-import base64
-from io import BytesIO
-from PIL import Image
 
 st.set_page_config(page_title="LeafSense: Disease Detection & Expert System", layout="wide")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -84,7 +79,6 @@ def load_faiss_metadata(metadata_path):
 @st.cache_resource(show_spinner=True)
 def load_encoder(): return SentenceTransformer('all-MiniLM-L6-v2')
 
-# ---------- Utility & pipeline functions ----------
 def normalize_class_name(name):
     return (name.replace(" ", "_").replace("-", "_").replace("__", "___").strip().lower())
 
@@ -138,6 +132,7 @@ def disease_expert_advisor(disease_query, faiss_index, faiss_metadata, encoder, 
             "prevention": metadata['prevention'],
             "severity_levels": metadata['severity_levels']
         })
+    # Generate concise Gemini advice
     prompt = (
         f"A farmer asked: \"{disease_query}\"\n"
         "Give only actionable info: Disease, Severity (if possible), Immediate action, Recommended pesticides, Prevention tips, When to act/treat, nothing more.\n"
@@ -162,6 +157,7 @@ def disease_expert_advisor(disease_query, faiss_index, faiss_metadata, encoder, 
     return short_advice, results
 
 def generate_gemini_recommendation_phase5(expert_advice, rag_context, lang="English"):
+    # Short actionable summary prompt
     prompt = (
         f"ONLY use the expert-verified info below. Be extremely practical, keep it bullet style, show only: Disease, Severity, Immediate action, Recommended pesticides, Prevention tips, When to act/treat. Nothing else.\n"
         f"Disease: {expert_advice['disease_name']}\n"
@@ -205,71 +201,32 @@ def calculate_severity(disease_mask, leaf_mask):
     else: label = "Severe"
     return severity, label, diseased_pixels, total_pixels
 
-# Optional: small switchable widget HTML (kept as fallback)
-CAMERA_WIDGET = r"""
-<style>
-  .btn { padding:6px 10px; border-radius:6px; background:#1976d2; color:white; border:none; font-weight:600; cursor:pointer; margin-right:6px; }
-</style>
-<div>
-  <div style="margin-bottom:8px;">
-    <button id="startBtn" class="btn">Start Camera (prefers back)</button>
-    <button id="switchBtn" class="btn">Switch Camera</button>
-    <button id="snapBtn" class="btn">Capture & Send</button>
-  </div>
-  <video id="video" width="320" height="240" autoplay playsinline style="border:1px solid #ddd;"></video>
-  <canvas id="canvas" width="320" height="240" style="display:none;"></canvas>
-</div>
-<script>
-let currentStream = null;
-async function startStream(constraints) {
-  if (currentStream) currentStream.getTracks().forEach(t=>t.stop());
-  try {
-    currentStream = await navigator.mediaDevices.getUserMedia(constraints);
-    document.getElementById('video').srcObject = currentStream;
-  } catch(e){ alert('Camera error: '+e.message); }
-}
-document.getElementById('startBtn').onclick = ()=> startStream({video:{facingMode:'environment'}, audio:false});
-document.getElementById('switchBtn').onclick = async ()=>{
-  // try toggling facingMode
-  await startStream({video:{facingMode:'user'}, audio:false});
-};
-document.getElementById('snapBtn').onclick = ()=>{
-  const v = document.getElementById('video'), c=document.getElementById('canvas');
-  c.width = v.videoWidth; c.height = v.videoHeight;
-  c.getContext('2d').drawImage(v,0,0);
-  const data = c.toDataURL('image/jpeg',0.9);
-  // send to parent via postMessage (some browsers)
-  window.parent.postMessage({isStreamlitImage:true, data}, "*");
-  // also write to title for fallback
-  document.title = data;
-  alert('Captured — now close this dialog and paste the data URL into the "Paste data URL" box OR use the Upload fallback.');
-};
-</script>
-"""
-
-def dataurl_to_cv2_img(data_url):
-    header, encoded = data_url.split(',', 1)
-    data = base64.b64decode(encoded)
-    image = Image.open(BytesIO(data)).convert("RGB")
-    open_cv_image = np.array(image)[:, :, ::-1]  # RGB->BGR
-    return open_cv_image
-
 def main():
-    st.markdown("<h1 style='text-align: center; color:#1976d2;'>🌿 LeafSense Disease Detection & Expert System</h1>", unsafe_allow_html=True)
-
-    # Sidebar
+    st.markdown(
+        "<h1 style='text-align: center; color: #1976d2;'>🌿 LeafSense Disease Detection & Expert System</h1>",
+        unsafe_allow_html=True
+    )
     with st.sidebar:
         st.markdown("## 🌱 Welcome to LeafSense!")
-        mode = st.radio("Mode:", ["Image Detection", "Ask Disease Expert"])
-        st.write("---")
+        st.markdown("### Choose Your Mode:")
+        mode = st.radio("What would you like to do?", ["Image Detection", "Ask Disease Expert"])
         if mode == "Image Detection":
-            st.write("Upload / Capture a clear leaf photo. On mobile, choose the Camera option in the picker.")
+            st.markdown("#### 📸 Image Detection Mode")
+            st.write(
+                "- Upload a **clear, full photo** of a single leaf on a plain background.\n"
+                "- Leaf should be visible edge-to-edge, with minimal shadow or overlap.\n"
+                "- Crop/zoom so the leaf fills most of the frame for best results.\n"
+                "- Upload a file for desktop, or 'Capture' on mobile/laptop with a webcam."
+            )
         else:
-            st.write("Describe symptoms to get expert advice.")
-
+            st.markdown("#### 💭 Disease Expert Mode")
+            st.write(
+                "- Describe the disease or symptoms you're concerned about.\n"
+                "- Our AI will search through 42+ diseases in our database.\n"
+                "- Get expert recommendations without needing a leaf photo!\n"
+                "- Perfect for farmers with specific disease questions."
+            )
     lang = st.selectbox("Choose Output Language:", ["English", "Telugu"])
-
-    # Load models
     with st.spinner("Loading models & FAISS index..."):
         yolo_model = load_yolo_model("leafsense_best.pt")
         unet_model = load_unet_model("best_weights.pth")
@@ -279,42 +236,28 @@ def main():
         faiss_index = load_faiss_index("faiss_index.bin")
         faiss_metadata = load_faiss_metadata("faiss_metadata.pkl")
         encoder = load_encoder()
-
     if mode == "Image Detection":
-        st.header("📷 Capture or Upload Leaf Image")
-        st.markdown("Tap the **Upload / Camera** button below on mobile to open camera. If you prefer, use the optional in-page camera widget (fallback).")
-
-        # Primary: use Streamlit's file_uploader (mobile browsers typically show camera option here)
-        uploaded_file = st.file_uploader("Capture or upload image", type=['jpg','jpeg','png'], accept_multiple_files=False, help="On mobile choose Camera to capture photo.")
-        img = None
-        source_type = None
-
-        # If user used file_uploader (most common mobile path), show preview immediately
-        if uploaded_file is not None:
-            input_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-            img = cv2.imdecode(input_bytes, cv2.IMREAD_COLOR)
-            source_type = "Uploaded / Captured via file picker"
-
-        # Optional: show the small switchable camera widget
-        with st.expander("Use in-page camera widget (optional)"):
-            st.markdown("This widget can prefer back camera and lets you switch; captured image must be pasted or uploaded if automatic transfer fails.")
-            components.html(CAMERA_WIDGET, height=340)
-            pasted = st.text_area("If you used the widget and the image didn't auto-import, paste the captured Data URL here (starts with 'data:image/jpeg;base64,')", height=80)
-            if pasted and pasted.strip().startswith("data:image"):
-                try:
-                    img = dataurl_to_cv2_img(pasted.strip())
-                    source_type = "Captured (widget pasted)"
-                except Exception:
-                    st.error("Failed to decode pasted data URL.")
-
-        if img is None:
-            st.info("Please capture or upload a leaf image to begin.")
+        input_mode = st.radio("How would you like to add your leaf photo?", ["Upload", "Camera"])
+        img, source_type = None, None
+        if input_mode == "Upload":
+            uploaded_file = st.file_uploader("Upload Leaf Image", type=['jpg', 'jpeg', 'png'])
+            if uploaded_file:
+                input_image_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+                img = cv2.imdecode(input_image_bytes, cv2.IMREAD_COLOR)
+                source_type = "Uploaded file"
+        elif input_mode == "Camera":
+            if st.button("Capture Photo"):
+                camera_image = st.camera_input("Take Photo (laptop/mobile webcam)")
+                if camera_image:
+                    img = cv2.imdecode(np.frombuffer(camera_image.getvalue(), np.uint8), cv2.IMREAD_COLOR)
+                    source_type = "Captured photo"
+        if img is not None:
+            with st.container():
+                st.markdown("#### Input Image Preview")
+                st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), caption=source_type, width=260)
+        else:
+            st.info("Please upload or capture a leaf image to begin.")
             st.stop()
-
-        # Show preview
-        st.markdown("#### Input image preview")
-        st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), use_column_width=False, width=360, caption=source_type)
-
         # ===== PHASE 1: Leaf Segmentation (YOLO) =====
         with st.spinner("PHASE 1: Segmenting leaf (YOLO)..."):
             yolo_results = yolo_model(img)
@@ -323,7 +266,6 @@ def main():
                 return
             leaf_mask = yolo_results[0].masks.data.cpu().numpy()[0]
         st.success("✅ Phase 1 Complete: Leaf Segmentation")
-
         # ===== PHASE 2: Disease Segmentation (UNet) =====
         with st.spinner("PHASE 2: Segmenting disease (UNet)..."):
             img_tensor = preprocess_image(img).unsqueeze(0).to(DEVICE)
@@ -332,7 +274,6 @@ def main():
                 pred_prob = torch.sigmoid(output)
                 pred_mask = (pred_prob > 0.5).float().cpu().squeeze().numpy()
         st.success("✅ Phase 2 Complete: Disease Segmentation")
-
         # ===== PHASE 3: Severity Calculation + Disease Classification =====
         severity, severity_label, diseased_px, total_px = calculate_severity(pred_mask, leaf_mask)
         st.markdown(f"<h2 style='color:#d84315;'>Severity: {severity:.2f}% ({severity_label})</h2>", unsafe_allow_html=True)
@@ -354,7 +295,6 @@ def main():
             st.success("✅ Phase 3 Complete: Disease Classification")
         else:
             st.warning("DenseNet model or class names not loaded. Classification skipped.")
-
         # ===== PHASE 4: EXPERT SYSTEM INFERENCE ENGINE =====
         with st.spinner("PHASE 4: Expert System Inference (KB Verification)..."):
             expert_advice = phase4_expert_system_inference(disease_class, severity_label, knowledge_base)
@@ -362,18 +302,15 @@ def main():
             st.warning(expert_advice["error"])
             return
         st.success("✅ Phase 4 Complete: Expert System Inference")
-
         # ===== PHASE 5: RAG + FAISS + GEMINI =====
         with st.spinner("PHASE 5: RAG Retrieval (FAISS + Gemini LLM)..."):
             rag_context = phase5_rag_with_faiss(expert_advice, faiss_index, faiss_metadata, encoder)
             gemini_summary = generate_gemini_recommendation_phase5(expert_advice, rag_context, lang)
         st.success("✅ Phase 5 Complete: RAG + LLM Report")
-
         # --- DISPLAY SHORT AI SUMMARY ---
         st.header("🌱 Short AI Summary")
         st.markdown(gemini_summary)
-
-        # Detailed report & visualizations
+        # --- See Full Detailed System Report ---
         with st.expander("See Full Detailed System Report"):
             st.markdown(f"**Disease:** {expert_advice['disease_name']}")
             st.markdown(f"**Severity Level:** {expert_advice['severity_level']}")
@@ -387,7 +324,7 @@ def main():
             for idx, line in enumerate(expert_advice['prevention'].split(". ")):
                 if line.strip():
                     st.markdown(f"{idx+1}. {line.strip()}.")
-
+        # --- Segmentation Visualization ---
         st.header("📊 Disease Prediction and Segmentation")
         fig, axes = plt.subplots(1, 4, figsize=(18, 6))
         image_vis = cv2.cvtColor(cv2.resize(img, (pred_mask.shape[1], pred_mask.shape[0])), cv2.COLOR_BGR2RGB)
@@ -401,7 +338,7 @@ def main():
         axes[3].set_title(f"Overlay & Prediction\n{disease_class.replace('___', ' - ')}\n{severity:.2f}% ({severity_label})")
         axes[3].axis('off')
         st.pyplot(fig)
-
+        # --- Download Full Report ---
         results = {
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "phase_1_segmentation": "Leaf segmented",
@@ -412,12 +349,16 @@ def main():
         }
         json_out = json.dumps(results, indent=2)
         st.download_button("⬇️ Download Full Report (JSON)", json_out, file_name="leafsense_analysis_report.json", mime="application/json")
-
     else:
-        # Expert advisor mode (unchanged)
         st.header("💭 Disease Expert Advisor")
         st.markdown("---")
-        disease_query = st.text_area("Describe disease/symptoms:", placeholder="e.g., 'tomato brown spots with yellow rings'", height=100)
+        st.markdown("### Ask About Any Plant Disease")
+        st.write("Describe the disease or symptoms you're concerned about. Our AI will search our database and provide expert recommendations.")
+        disease_query = st.text_area(
+            "Describe your disease/symptom concern:",
+            placeholder="e.g., 'My tomato leaves have brown spots with yellow rings' or 'What is early blight?'",
+            height=100
+        )
         if st.button("🔍 Get Expert Recommendation", key="expert_btn"):
             if not disease_query.strip():
                 st.warning("Please describe a disease or symptom!")
