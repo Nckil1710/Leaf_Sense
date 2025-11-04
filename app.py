@@ -1,4 +1,4 @@
-# app.py (mobile-first capture with back-camera hint + immediate preview)
+# app.py - Mobile-first one-click capture + PC webcam + upload fallback
 import streamlit as st
 import streamlit.components.v1 as components
 import torch
@@ -24,12 +24,12 @@ warnings.filterwarnings('ignore')
 from datetime import datetime
 import base64
 from io import BytesIO
-from PIL import Image
+from PIL import Image, ImageOps, ExifTags
 
 st.set_page_config(page_title="LeafSense: Disease Detection & Expert System", layout="wide")
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ==== Gemini Key Setup ====
+# ---- Gemini setup (same as before) ----
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"] if "GEMINI_API_KEY" in st.secrets else os.getenv("GEMINI_API_KEY")
 if GEMINI_API_KEY is None:
     st.error("No Gemini API key configured. Please set GEMINI_API_KEY.")
@@ -37,7 +37,7 @@ if GEMINI_API_KEY is None:
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-2.5-flash')
 
-# --- Cache Loaders (as in your original app) ---
+# ---- Cached loaders (unchanged) ----
 @st.cache_resource(show_spinner=True)
 def load_yolo_model(path): return YOLO(path)
 
@@ -84,7 +84,7 @@ def load_faiss_metadata(metadata_path):
 @st.cache_resource(show_spinner=True)
 def load_encoder(): return SentenceTransformer('all-MiniLM-L6-v2')
 
-# ---------- Utility & pipeline functions (unchanged) ----------
+# ---- Pipeline helpers (unchanged logic but kept local) ----
 def normalize_class_name(name):
     return (name.replace(" ", "_").replace("-", "_").replace("__", "___").strip().lower())
 
@@ -186,70 +186,107 @@ def calculate_severity(disease_mask, leaf_mask):
     else: label = "Severe"
     return severity, label, diseased_pixels, total_pixels
 
-# ---------- Small HTML capture control that requests back camera on mobile ----------
-# This is an INPUT element with capture="environment" — most mobile browsers will open the back camera app.
-CAMERA_CAPTURE_HTML = """
+# ---- image utilities: server-side autorotate + compress (safe) ----
+def pil_autorotate(img: Image.Image) -> Image.Image:
+    try:
+        return ImageOps.exif_transpose(img)
+    except Exception:
+        return img
+
+def compress_image_bytes(input_bytes: bytes, max_dim: int = 1024, quality: int = 85) -> np.ndarray:
+    """
+    Convert raw bytes -> OpenCV BGR image:
+      - auto-rotate using EXIF
+      - downscale so longest side <= max_dim
+      - re-encode to JPEG with given quality to reduce size
+    """
+    try:
+        img = Image.open(BytesIO(input_bytes)).convert("RGB")
+    except Exception as e:
+        raise ValueError(f"Could not open image: {e}")
+
+    img = pil_autorotate(img)
+    w, h = img.size
+    if max(w, h) > max_dim:
+        scale = max_dim / max(w, h)
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+    out = BytesIO()
+    img.save(out, format='JPEG', quality=quality, optimize=True)
+    arr = np.frombuffer(out.getvalue(), dtype=np.uint8)
+    cv_img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    return cv_img
+
+# ---- client-side camera HTML (mobile-friendly file input with capture=environment).
+# This input will open back camera on most mobile browsers and returns file immediately.
+CAMERA_HTML_MOBILE = """
 <div style="display:flex; gap:8px; align-items:center;">
   <label style="background:#1976d2;color:#fff;padding:10px 14px;border-radius:8px;cursor:pointer;font-weight:600;">
-    📷 Open Camera (back)
-    <input id="cameraInput" accept="image/*" capture="environment" type="file" style="display:none" />
+    📷 Use Camera (mobile)
+    <input id="mfile" accept="image/*" capture="environment" type="file" style="display:none" />
   </label>
-  <button id="sendBtn" style="padding:8px 10px;border-radius:8px;background:#444;color:#fff;border:none;cursor:pointer;">
-    Import Captured Image
-  </button>
+  <span style="color:#666;font-size:0.9em;">(opens back camera on most phones)</span>
 </div>
 <script>
-const input = document.getElementById('cameraInput');
-const sendBtn = document.getElementById('sendBtn');
-let lastDataUrl = "";
-input.onchange = function(e) {
-  const file = e.target.files[0];
-  if(!file) return;
-  const reader = new FileReader();
-  reader.onload = function(ev) {
-    lastDataUrl = ev.target.result; // data:image/jpeg;base64,...
-    // store to document.title so Streamlit can later read it via a small getter
-    document.title = lastDataUrl;
-    alert("Image captured. Now click 'Import Captured Image' in the page to load it.");
-  };
-  reader.readAsDataURL(file);
-};
-// The "Import Captured Image" button simply sets a marker in document.title again (no-op if already set)
-sendBtn.onclick = function() {
-  if(lastDataUrl) {
-    document.title = lastDataUrl;
-    alert("Image data saved to page title. Now return to Streamlit and click 'Load Captured Image' (below).");
-  } else {
-    alert("No captured image found. Use 'Open Camera (back)' first and take a photo.");
-  }
+document.getElementById('mfile').onchange = function(e){
+  // nothing else — file will be returned to Streamlit via normal file_uploader path
 };
 </script>
 """
 
-def dataurl_to_cv2_img(data_url):
+# ---- simple inline webcam widget for PC (capture and write data URL into textarea for paste) ----
+WEBCAM_HTML_PC = r"""
+<div style="font-size:14px; margin-bottom:6px;">Inline webcam (desktop): start, capture, then press 'Use Captured' below</div>
+<video id="v" width="420" height="315" autoplay playsinline style="border:1px solid #ddd;"></video>
+<br/>
+<button onclick="startCam()" style="padding:6px 10px;border-radius:6px;background:#1976d2;color:#fff;border:none;">Start</button>
+<button onclick="snap()" style="padding:6px 10px;border-radius:6px;background:#388e3c;color:#fff;border:none;margin-left:6px;">Capture</button>
+<canvas id="c" width="420" height="315" style="display:none;"></canvas>
+<script>
+async function startCam(){
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({video:true, audio:false});
+    document.getElementById('v').srcObject = s;
+  } catch(e){ alert('Camera error: '+e.message); }
+}
+function snap(){
+  const v=document.getElementById('v'), c=document.getElementById('c');
+  c.width = v.videoWidth; c.height = v.videoHeight;
+  const ctx = c.getContext('2d'); ctx.drawImage(v,0,0);
+  const data = c.toDataURL('image/jpeg',0.9);
+  // write data URL into document.title (some browsers may keep it) and post message to parent
+  document.title = data;
+  window.parent.postMessage({isStreamlitImage:true, data}, "*");
+  // also populate an auto textarea if exists (Streamlit will show a paste box below)
+  const ta = document.getElementById('capturedDataTextarea');
+  if(ta){ ta.value = data; }
+  alert('Captured. If the app auto-imports, you will see the preview. Otherwise paste the data URL into the paste box below.');
+}
+</script>
+"""
+
+def dataurl_to_cv2_img(data_url: str) -> np.ndarray:
     header, encoded = data_url.split(',', 1)
     data = base64.b64decode(encoded)
-    image = Image.open(BytesIO(data)).convert("RGB")
-    open_cv_image = np.array(image)[:, :, ::-1]  # RGB->BGR
-    return open_cv_image
+    return compress_image_bytes(data, max_dim=1024, quality=85)  # reuse compression for safety
 
-# ---------- Main app ----------
+# ---- main app ----
 def main():
     st.markdown("<h1 style='text-align:center;color:#1976d2;'>🌿 LeafSense Disease Detection & Expert System</h1>", unsafe_allow_html=True)
 
-    # Sidebar selection
+    # Sidebar: mode selection UI
     with st.sidebar:
-        st.markdown("## 🌱 Welcome to LeafSense!")
-        mode = st.radio("Mode:", ["Image Detection", "Ask Disease Expert"])
+        st.markdown("## 🌱 Input Mode")
+        mode_choice = st.radio("Choose input mode", ["Camera → Mobile", "Camera → PC", "Upload from Device"])
         st.write("---")
-        if mode == "Image Detection":
-            st.write("Upload / Capture a clear leaf photo. On mobile choose Camera in the picker or use the 'Open Camera (back)' button.")
-        else:
-            st.write("Describe symptoms to get expert advice.")
+        st.markdown("Tips:")
+        st.write("- Mobile: tap *Use Camera (mobile)* and take the photo (one step).")
+        st.write("- PC: use inline webcam capture (start → capture → Use Captured).")
+        st.write("- Upload: browse device files as normal.")
 
     lang = st.selectbox("Choose Output Language:", ["English", "Telugu"])
 
-    # Load models/resources (same as your app)
+    # Load models/resources
     with st.spinner("Loading models & FAISS index..."):
         yolo_model = load_yolo_model("leafsense_best.pt")
         unet_model = load_unet_model("best_weights.pth")
@@ -260,200 +297,172 @@ def main():
         faiss_metadata = load_faiss_metadata("faiss_metadata.pkl")
         encoder = load_encoder()
 
-    if mode == "Image Detection":
-        st.header("📷 Capture or Upload Leaf Image")
-        st.markdown("**Mobile:** press *Open Camera (back)* then take photo. After capture click *Import Captured Image* and then press *Load Captured Image* below.  \n**Desktop:** use Upload (or optional widget).")
+    img = None
+    source_type = None
 
-        # 1) show HTML capture control which requests back camera on mobile
-        components.html(CAMERA_CAPTURE_HTML, height=90)
-
-        # 2) button that tries to read document.title (where the HTML JS stores the data URL).
-        if st.button("Load Captured Image (from camera)"):
-            getter = """
-            <script>
-              // write back the document.title content into the body so Streamlit can fetch it
-              const t = document.title || '';
-              document.open(); document.write('<div id="data">' + t + '</div>'); document.close();
-            </script>
-            """
-            # Render small snippet (this will update the iframe document.title content client-side)
-            components.html(getter, height=60)
-            st.info("If your browser allowed the camera capture, the captured image should now be available in the paste-box below automatically. If not, use the Upload button or paste the data URL into the box.")
-
-        # 3) Primary uploader (most reliable cross-platform): file_uploader
-        uploaded_file = st.file_uploader("Or Capture / Upload Image (recommended)", type=['jpg','jpeg','png'])
-        pasted = st.text_area("Paste data URL here if you used the camera control and it didn't auto-load (starts with 'data:image/')", height=80)
-
-        img = None
-        source_type = None
-
+    # -- Mobile camera flow (recommended one-step) --
+    if mode_choice == "Camera → Mobile":
+        st.markdown("### Mobile camera (one-step). Tap the button to open the phone camera.")
+        # show embedded HTML file input requesting back camera
+        components.html(CAMERA_HTML_MOBILE, height=80)
+        # Also show a file_uploader so phones that expose camera via picker will return file immediately
+        uploaded_file = st.file_uploader("Or use this to capture/upload (recommended for mobile)", type=['jpg','jpeg','png'])
         if uploaded_file is not None:
-            bytes_in = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-            img = cv2.imdecode(bytes_in, cv2.IMREAD_COLOR)
-            source_type = "Uploaded / mobile camera via picker"
+            raw = uploaded_file.read()
+            try:
+                img = compress_image_bytes(raw, max_dim=1024, quality=85)
+                source_type = "Mobile camera (file_uploader)"
+            except Exception as e:
+                st.error(f"Image decoding error: {e}")
+                st.stop()
 
-        elif pasted and pasted.strip().startswith("data:image"):
+    # -- PC camera flow (desktop) --
+    elif mode_choice == "Camera → PC":
+        st.markdown("### PC webcam: start the camera (allow permission), capture, then click 'Use Captured' below to import.")
+        components.html(WEBCAM_HTML_PC, height=380)
+        # show a paste box that JS tries to fill automatically; also allow manual paste
+        pasted = st.text_area("Captured data URL (auto-filled if allowed) — otherwise paste it here", key="capturedData", height=120)
+        if pasted and pasted.strip().startswith("data:image"):
             try:
                 img = dataurl_to_cv2_img(pasted.strip())
-                source_type = "Captured (pasted data URL)"
+                source_type = "PC webcam (captured)"
             except Exception as e:
                 st.error("Failed to decode pasted data URL.")
+                st.stop()
 
-        # Optional: small in-page webcam widget (keeps as fallback but not primary)
-        with st.expander("Optional: Inline webcam (desktop)"):
-            webcam_html = """
-            <video id="v" width="320" height="240" autoplay playsinline style="border:1px solid #ddd;"></video>
-            <div style="margin-top:6px;">
-              <button onclick="startBack()" style="padding:6px 10px;background:#1976d2;color:#fff;border:none;border-radius:6px;">Start (back pref)</button>
-              <button onclick="snap()" style="padding:6px 10px;background:#444;color:#fff;border:none;border-radius:6px;">Capture</button>
-            </div>
-            <canvas id="c" width="320" height="240" style="display:none;"></canvas>
-            <script>
-            async function startBack(){
-              try {
-                const s = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}, audio:false});
-                document.getElementById('v').srcObject = s;
-              } catch(e){ alert('Camera error: '+e.message); }
-            }
-            function snap(){
-              const v=document.getElementById('v'), c=document.getElementById('c');
-              c.width=v.videoWidth; c.height=v.videoHeight;
-              c.getContext('2d').drawImage(v,0,0);
-              const data = c.toDataURL('image/jpeg',0.9);
-              document.title = data;
-              alert('Captured. Paste the data URL into the paste box on the page.');
-            }
-            </script>
-            """
-            components.html(webcam_html, height=320)
+        # also allow normal file upload fallback
+        uploaded_file_pc = st.file_uploader("Or upload an image file (fallback)", type=['jpg','jpeg','png'], key="pc_upload")
+        if (img is None) and (uploaded_file_pc is not None):
+            raw = uploaded_file_pc.read()
+            try:
+                img = compress_image_bytes(raw, max_dim=1024, quality=85)
+                source_type = "PC upload fallback"
+            except Exception as e:
+                st.error(f"Decoding error: {e}")
+                st.stop()
 
-        if img is None:
-            st.info("Please capture or upload a leaf image to begin (use Upload or the 'Open Camera (back)' flow).")
-            st.stop()
-
-        # Show preview immediately
-        st.markdown("#### Input image preview")
-        st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), caption=source_type, width=360)
-
-        # ===== PHASE 1: Leaf Segmentation (YOLO) =====
-        with st.spinner("PHASE 1: Segmenting leaf (YOLO)..."):
-            yolo_res = yolo_model(img)
-            if (not hasattr(yolo_res[0], "masks")) or (yolo_res[0].masks is None):
-                st.error("No leaf detected. Try again with a clearer leaf photo!")
-                return
-            leaf_mask = yolo_res[0].masks.data.cpu().numpy()[0]
-        st.success("✅ Phase 1 Complete: Leaf Segmentation")
-
-        # ===== PHASE 2: UNet disease mask =====
-        with st.spinner("PHASE 2: Segmenting disease (UNet)..."):
-            img_tensor = preprocess_image(img).unsqueeze(0).to(DEVICE)
-            with torch.no_grad():
-                output = unet_model(img_tensor)
-                pred_prob = torch.sigmoid(output)
-                pred_mask = (pred_prob > 0.5).float().cpu().squeeze().numpy()
-        st.success("✅ Phase 2 Complete: Disease Segmentation")
-
-        # ===== PHASE 3: Severity + Classification =====
-        severity, severity_label, dpx, tpx = calculate_severity(pred_mask, leaf_mask)
-        st.markdown(f"<h2 style='color:#d84315;'>Severity: {severity:.2f}% ({severity_label})</h2>", unsafe_allow_html=True)
-        disease_class, pred_conf = "Unknown", 0.0
-        if densenet_model is not None and class_names is not None:
-            with st.spinner("PHASE 3: Classifying disease (DenseNet121)..."):
-                IMG_SIZE = 224
-                img_tf = tf.image.resize_with_pad(tf.image.decode_image(cv2.imencode('.jpg', img)[1].tobytes(), channels=3), IMG_SIZE, IMG_SIZE)
-                img_tf = tf.cast(img_tf, tf.float32)
-                from tensorflow.keras.applications.densenet import preprocess_input
-                img_tf = preprocess_input(img_tf)
-                img_tf = tf.expand_dims(img_tf, 0)
-                pred = densenet_model.predict(img_tf, verbose=0)
-                pred_class = np.argmax(pred, axis=1)[0]
-                disease_class = class_names[pred_class]
-                pred_conf = float(np.max(pred))
-            st.markdown(f"<h3 style='color:#388e3c;'>Disease: {disease_class.replace('___',' - ')}</h3>", unsafe_allow_html=True)
-            st.markdown(f"<b>Model confidence:</b> {pred_conf:.4f}")
-            st.success("✅ Phase 3 Complete: Disease Classification")
-        else:
-            st.warning("DenseNet model or class names not loaded. Classification skipped.")
-
-        # ===== PHASE 4: Expert system inference =====
-        with st.spinner("PHASE 4: Expert System Inference (KB Verification)..."):
-            expert_advice = phase4_expert_system_inference(disease_class, severity_label, knowledge_base)
-        if "error" in expert_advice:
-            st.warning(expert_advice["error"])
-            return
-        st.success("✅ Phase 4 Complete: Expert System Inference")
-
-        # ===== PHASE 5: RAG + Gemini =====
-        with st.spinner("PHASE 5: RAG Retrieval (FAISS + Gemini LLM)..."):
-            rag_context = phase5_rag_with_faiss(expert_advice, faiss_index, faiss_metadata, encoder)
-            gemini_summary = generate_gemini_recommendation_phase5(expert_advice, rag_context, lang)
-        st.success("✅ Phase 5 Complete: RAG + LLM Report")
-
-        # Display short summary and expanded report + visualizations (same rendering as before)
-        st.header("🌱 Short AI Summary")
-        st.markdown(gemini_summary)
-
-        with st.expander("See Full Detailed System Report"):
-            st.markdown(f"**Disease:** {expert_advice['disease_name']}")
-            st.markdown(f"**Severity Level:** {expert_advice['severity_level']}")
-            st.markdown(f"**Symptoms:** {expert_advice['symptoms']}")
-            st.markdown(f"**Severity Description:** {expert_advice['severity_description']}")
-            st.markdown("**Pesticides Recommended:**")
-            for p in expert_advice['pesticides'].split(","):
-                st.markdown(f"- {p.strip()}")
-            st.markdown(f"**Treatment:** {expert_advice['treatment']}")
-            st.markdown(f"**Prevention:**")
-            for idx, line in enumerate(expert_advice['prevention'].split(". ")):
-                if line.strip():
-                    st.markdown(f"{idx+1}. {line.strip()}.")
-
-        st.header("📊 Disease Prediction and Segmentation")
-        fig, axes = plt.subplots(1, 4, figsize=(18, 6))
-        image_vis = cv2.cvtColor(cv2.resize(img, (pred_mask.shape[1], pred_mask.shape[0])), cv2.COLOR_BGR2RGB)
-        axes[0].imshow(image_vis); axes[0].set_title("Original Image"); axes[0].axis('off')
-        axes[1].imshow(leaf_mask, cmap='Greens', alpha=0.8); axes[1].set_title("Leaf Mask (YOLO)"); axes[1].axis('off')
-        axes[2].imshow(pred_mask, cmap='autumn', alpha=0.8); axes[2].set_title("Disease Mask (UNet)"); axes[2].axis('off')
-        overlay = np.zeros_like(pred_mask)
-        overlay[(pred_mask > 0) & (resize(leaf_mask, pred_mask.shape, order=0, preserve_range=True, anti_aliasing=False) > 0)] = 1
-        axes[3].imshow(image_vis)
-        axes[3].imshow(overlay, cmap='autumn', alpha=0.5)
-        axes[3].set_title(f"Overlay & Prediction\n{disease_class.replace('___', ' - ')}\n{severity:.2f}% ({severity_label})")
-        axes[3].axis('off')
-        st.pyplot(fig)
-
-        # Download JSON report
-        results = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "phase_1_segmentation": "Leaf segmented",
-            "phase_2_disease_segmentation": "Disease area identified",
-            "phase_3_classification": {"disease": disease_class, "confidence": pred_conf, "severity": severity_label},
-            "phase_4_expert_inference": expert_advice,
-            "phase_5_rag_output": {"gemini_summary": gemini_summary, "language": lang},
-        }
-        st.download_button("⬇️ Download Full Report (JSON)", json.dumps(results, indent=2), file_name="leafsense_analysis_report.json", mime="application/json")
-
+    # -- Upload from device mode --
     else:
-        # Expert advisor mode (unchanged)
-        st.header("💭 Disease Expert Advisor")
-        st.markdown("---")
-        disease_query = st.text_area("Describe disease/symptoms:", placeholder="e.g., 'tomato brown spots with yellow rings'", height=100)
-        if st.button("🔍 Get Expert Recommendation", key="expert_btn"):
-            if not disease_query.strip():
-                st.warning("Please describe a disease or symptom!")
-            else:
-                with st.spinner("Searching database and generating recommendations..."):
-                    recommendation, matched_diseases = disease_expert_advisor(disease_query, faiss_index, faiss_metadata, encoder, knowledge_base, lang)
-                st.success("✅ Expert Recommendation Generated!")
-                st.header("🌱 Short AI Summary")
-                st.markdown(recommendation)
-                st.markdown("---")
-                st.header("📚 Top Matching Diseases in Database")
-                for i, disease in enumerate(matched_diseases, 1):
-                    with st.expander(f"{i}. {disease['disease']}"):
-                        st.markdown(f"**Symptoms:** {disease['symptoms']}")
-                        st.markdown(f"**Pesticides:** {disease['pesticides']}")
-                        st.markdown(f"**Prevention:** {disease['prevention']}")
-                        st.markdown(f"**Severity Levels:** {', '.join(disease['severity_levels'])}")
+        st.markdown("### Upload from device")
+        uploaded = st.file_uploader("Upload image", type=['jpg','jpeg','png'])
+        if uploaded is not None:
+            raw = uploaded.read()
+            try:
+                img = compress_image_bytes(raw, max_dim=1024, quality=85)
+                source_type = "Uploaded file"
+            except Exception as e:
+                st.error(f"Image decode error: {e}")
+                st.stop()
+
+    # If no image, stop and wait
+    if img is None:
+        st.info("No image yet — capture or upload a photo to run the pipeline.")
+        st.stop()
+
+    # show preview immediately
+    st.markdown("#### Input image preview")
+    st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), width=360, caption=source_type)
+
+    # ===== PHASE 1: Leaf segmentation (YOLO) =====
+    with st.spinner("PHASE 1: Segmenting leaf (YOLO)..."):
+        try:
+            yres = yolo_model(img)
+        except Exception as e:
+            st.error(f"YOLO model error: {e}")
+            st.stop()
+        if (not hasattr(yres[0], "masks")) or (yres[0].masks is None):
+            st.error("No leaf detected. Try again with a clearer leaf photo.")
+            st.stop()
+        leaf_mask = yres[0].masks.data.cpu().numpy()[0]
+    st.success("✅ Phase 1 Complete")
+
+    # ===== PHASE 2: Unet disease mask =====
+    with st.spinner("PHASE 2: Segmenting disease (UNet)..."):
+        img_tensor = preprocess_image(img).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            out = unet_model(img_tensor)
+            pred_prob = torch.sigmoid(out)
+            pred_mask = (pred_prob > 0.5).float().cpu().squeeze().numpy()
+    st.success("✅ Phase 2 Complete")
+
+    # ===== PHASE 3: Severity + classification =====
+    severity, severity_label, dpx, tpx = calculate_severity(pred_mask, leaf_mask)
+    st.markdown(f"<h2 style='color:#d84315;'>Severity: {severity:.2f}% ({severity_label})</h2>", unsafe_allow_html=True)
+    disease_class, pred_conf = "Unknown", 0.0
+    if densenet_model is not None and class_names is not None:
+        with st.spinner("PHASE 3: Classifying disease..."):
+            IMG_SIZE = 224
+            img_tf = tf.image.resize_with_pad(tf.image.decode_image(cv2.imencode('.jpg', img)[1].tobytes(), channels=3), IMG_SIZE, IMG_SIZE)
+            img_tf = tf.cast(img_tf, tf.float32)
+            from tensorflow.keras.applications.densenet import preprocess_input
+            img_tf = preprocess_input(img_tf)
+            img_tf = tf.expand_dims(img_tf, 0)
+            pred = densenet_model.predict(img_tf, verbose=0)
+            pred_class = np.argmax(pred, axis=1)[0]
+            disease_class = class_names[pred_class]
+            pred_conf = float(np.max(pred))
+        st.markdown(f"<h3 style='color:#388e3c;'>Disease: {disease_class.replace('___',' - ')}</h3>", unsafe_allow_html=True)
+        st.markdown(f"<b>Model confidence:</b> {pred_conf:.4f}")
+        st.success("✅ Phase 3 Complete")
+    else:
+        st.warning("DenseNet model / class names not loaded — classification skipped.")
+
+    # ===== PHASE 4: Expert system inference =====
+    with st.spinner("PHASE 4: Expert inference..."):
+        expert_advice = phase4_expert_system_inference(disease_class, severity_label, knowledge_base)
+    if "error" in expert_advice:
+        st.warning(expert_advice["error"])
+        st.stop()
+    st.success("✅ Phase 4 Complete")
+
+    # ===== PHASE 5: RAG + Gemini =====
+    with st.spinner("PHASE 5: RAG + LLM summary..."):
+        rag_ctx = phase5_rag_with_faiss(expert_advice, faiss_index, faiss_metadata, encoder)
+        gemini_summary = generate_gemini_recommendation_phase5(expert_advice, rag_ctx, lang)
+    st.success("✅ Phase 5 Complete")
+
+    # Display results & visualizations
+    st.header("🌱 Short AI Summary")
+    st.markdown(gemini_summary)
+
+    with st.expander("See Full Detailed System Report"):
+        st.markdown(f"**Disease:** {expert_advice['disease_name']}")
+        st.markdown(f"**Severity Level:** {expert_advice['severity_level']}")
+        st.markdown(f"**Symptoms:** {expert_advice['symptoms']}")
+        st.markdown(f"**Severity Description:** {expert_advice['severity_description']}")
+        st.markdown("**Pesticides Recommended:**")
+        for p in expert_advice['pesticides'].split(","):
+            st.markdown(f"- {p.strip()}")
+        st.markdown(f"**Treatment:** {expert_advice['treatment']}")
+        st.markdown(f"**Prevention:**")
+        for idx, line in enumerate(expert_advice['prevention'].split(". ")):
+            if line.strip():
+                st.markdown(f"{idx+1}. {line.strip()}.")
+
+    st.header("📊 Disease Prediction and Segmentation")
+    fig, axes = plt.subplots(1, 4, figsize=(18, 6))
+    image_vis = cv2.cvtColor(cv2.resize(img, (pred_mask.shape[1], pred_mask.shape[0])), cv2.COLOR_BGR2RGB)
+    axes[0].imshow(image_vis); axes[0].set_title("Original Image"); axes[0].axis('off')
+    axes[1].imshow(leaf_mask, cmap='Greens', alpha=0.8); axes[1].set_title("Leaf Mask (YOLO)"); axes[1].axis('off')
+    axes[2].imshow(pred_mask, cmap='autumn', alpha=0.8); axes[2].set_title("Disease Mask (UNet)"); axes[2].axis('off')
+    overlay = np.zeros_like(pred_mask)
+    overlay[(pred_mask > 0) & (resize(leaf_mask, pred_mask.shape, order=0, preserve_range=True, anti_aliasing=False) > 0)] = 1
+    axes[3].imshow(image_vis)
+    axes[3].imshow(overlay, cmap='autumn', alpha=0.5)
+    axes[3].set_title(f"Overlay & Prediction\n{disease_class.replace('___',' - ')}\n{severity:.2f}% ({severity_label})")
+    axes[3].axis('off')
+    st.pyplot(fig)
+
+    # JSON report download
+    results = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "phase_1_segmentation": "Leaf segmented",
+        "phase_2_disease_segmentation": "Disease area identified",
+        "phase_3_classification": {"disease": disease_class, "confidence": pred_conf, "severity": severity_label},
+        "phase_4_expert_inference": expert_advice,
+        "phase_5_rag_output": {"gemini_summary": gemini_summary, "language": lang},
+    }
+    st.download_button("⬇️ Download Full Report (JSON)", json.dumps(results, indent=2), file_name="leafsense_analysis_report.json", mime="application/json")
 
 if __name__ == "__main__":
     main()
